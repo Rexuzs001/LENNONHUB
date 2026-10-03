@@ -1,20 +1,56 @@
-local Players = game.Players
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-game:GetService("SoundService")
-game:GetService("Debris")
 
 local localPlayer = Players.LocalPlayer
-local networking = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Networking")
+
+local function getWorldRoot()
+	return workspace:FindFirstChild("World") or workspace:FindFirstChild("OBJECTS")
+end
+
+local function getAreas()
+	local root = getWorldRoot()
+	return root and root:FindFirstChild("Areas")
+end
+
+local function getGuardAreas()
+	local areas = getAreas()
+	return areas and areas:FindFirstChild("GuardAreas")
+end
+
+local function getGround()
+	local areas = getAreas()
+	return areas and areas:FindFirstChild("Ground")
+end
+
+local function getStartArea()
+	local areas = getAreas()
+	return areas and areas:FindFirstChild("StartArea")
+end
+
+local networking = nil
+pcall(function()
+	local packages = ReplicatedStorage:FindFirstChild("Packages") or ReplicatedStorage:WaitForChild("Packages", 5)
+	if packages then
+		networking = packages:FindFirstChild("Networking") or packages:WaitForChild("Networking", 5)
+	end
+end)
 
 local remotes = {
-	AskFieldEggSnapshot = networking:WaitForChild("RF/EggWorld/AskFieldEggSnapshot", 10),
-	AskFieldEggCarry = networking:WaitForChild("RF/EggWorld/AskFieldEggCarry", 10),
-	AskFieldEggDrop = networking:WaitForChild("RF/EggWorld/AskFieldEggDrop", 10),
-	FieldEggCarry = networking:WaitForChild("RE/EggWorld/FieldEggCarry", 10),
+	AskFieldEggSnapshot = nil,
+	AskFieldEggCarry = nil,
+	AskFieldEggDrop = nil,
+	FieldEggCarry = nil,
 }
+
+if networking then
+	remotes.AskFieldEggSnapshot = networking:FindFirstChild("RF/EggWorld/AskFieldEggSnapshot") or networking:WaitForChild("RF/EggWorld/AskFieldEggSnapshot", 5)
+	remotes.AskFieldEggCarry = networking:FindFirstChild("RF/EggWorld/AskFieldEggCarry") or networking:WaitForChild("RF/EggWorld/AskFieldEggCarry", 5)
+	remotes.AskFieldEggDrop = networking:FindFirstChild("RF/EggWorld/AskFieldEggDrop") or networking:WaitForChild("RF/EggWorld/AskFieldEggDrop", 5)
+	remotes.FieldEggCarry = networking:FindFirstChild("RE/EggWorld/FieldEggCarry") or networking:WaitForChild("RE/EggWorld/FieldEggCarry", 5)
+end
 
 local util = {}
 
@@ -25,313 +61,12 @@ util.walk = function(root, fn)
 		local n = #stack
 		local v = stack[n]
 		stack[n] = nil
-		local kids = v:GetChildren()
-		for i = 1, #kids do
-			stack[#stack + 1] = kids[i]
+		for _, child in ipairs(v:GetChildren()) do
+			stack[#stack + 1] = child
 		end
-		if fn(v) == true then
-			return v
-		end
+		if fn(v) == true then return v end
 	end
 	return nil
-end
-
-util.snapshot = function(root)
-	local out = {}
-	util.walk(root, function(obj)
-		out[#out + 1] = obj
-	end)
-	return out
-end
-
-util.Integrity = {
-	armed = false,
-	restoring = false,
-	connections = {},
-	records = {},
-	knownRootChildren = {},
-	repairQueued = false,
-	hardUntil = 0,
-	hardRefreshAt = 0,
-	tamperCount = 0,
-	tamperWindow = 0,
-	guardName = "LHVisualGuard_" .. tostring(math.random(100000, 999999)),
-}
-
-util.integrityDisconnect = function()
-	local integrity = util.Integrity
-	for i = 1, #integrity.connections do
-		local c = integrity.connections[i]
-		if c then
-			pcall(function()
-				c:Disconnect()
-			end)
-		end
-	end
-	table.clear(integrity.connections)
-	pcall(function()
-		RunService:UnbindFromRenderStep(integrity.guardName)
-	end)
-end
-
-util.integrityEscalate = function()
-	local integrity = util.Integrity
-	local now = os.clock()
-	if now - integrity.tamperWindow > 0.45 then
-		integrity.tamperWindow = now
-		integrity.tamperCount = 0
-	end
-	integrity.tamperCount = integrity.tamperCount + 1
-	if integrity.tamperCount >= 3 then
-		integrity.hardUntil = math.max(integrity.hardUntil, now + 2.5)
-	end
-end
-
-util.integrityRepairRecord = function(rec, prop)
-	local inst = rec and rec.instance
-	if not inst then return end
-	if rec.parent and inst.Parent ~= rec.parent then
-		pcall(function()
-			inst.Parent = rec.parent
-		end)
-	end
-	if prop then
-		local val = rec.properties[prop]
-		if val ~= nil then
-			local ok, cur = pcall(function()
-				return inst[prop]
-			end)
-			if ok and cur ~= val then
-				pcall(function()
-					inst[prop] = val
-				end)
-			end
-		end
-		return
-	end
-	for k, property in pairs(rec.properties) do
-		local ok, cur = pcall(function()
-			return inst[k]
-		end)
-		if ok and cur ~= property then
-			pcall(function()
-				inst[k] = property
-			end)
-		end
-	end
-end
-
-util.integrityQueueRepair = function()
-	local integrity = util.Integrity
-	if not integrity.armed or integrity.restoring or integrity.repairQueued then return end
-	integrity.repairQueued = true
-	task.defer(function()
-		integrity.repairQueued = false
-		util.integrityRepairAll()
-	end)
-end
-
-util.integrityRepairAll = function()
-	local integrity = util.Integrity
-	if not integrity.armed or integrity.restoring then return end
-	integrity.restoring = true
-	for i = 1, #integrity.records do
-		util.integrityRepairRecord(integrity.records[i])
-	end
-	if integrity.refresh then
-		pcall(integrity.refresh)
-	end
-	integrity.restoring = false
-end
-
-util.integrityWatch = function(inst, props, parent)
-	if not inst then return end
-	local integrity = util.Integrity
-	local rec = { instance = inst, properties = props, parent = parent }
-	integrity.records[#integrity.records + 1] = rec
-	if parent then
-		integrity.connections[#integrity.connections + 1] = inst.AncestryChanged:Connect(function()
-			if not integrity.armed or integrity.restoring or inst.Parent == parent then return end
-			util.integrityEscalate()
-			integrity.restoring = true
-			pcall(function()
-				inst.Parent = parent
-			end)
-			integrity.restoring = false
-			if inst.Parent ~= parent then
-				util.integrityQueueRepair()
-			end
-		end)
-	end
-	integrity.connections[#integrity.connections + 1] = inst.Changed:Connect(function(prop)
-		if not integrity.armed or integrity.restoring or props[prop] == nil then return end
-		local ok, cur = pcall(function()
-			return inst[prop]
-		end)
-		if ok and cur == props[prop] then return end
-		util.integrityEscalate()
-		integrity.restoring = true
-		util.integrityRepairRecord(rec, prop)
-		integrity.restoring = false
-	end)
-end
-
-util.integrityWatchComputed = function(inst, props, repair)
-	if not inst or not repair then return end
-	local integrity = util.Integrity
-	local map = {}
-	for i = 1, #props do
-		map[props[i]] = true
-	end
-	integrity.connections[#integrity.connections + 1] = inst.Changed:Connect(function(prop)
-		if not integrity.armed or integrity.restoring or not map[prop] then return end
-		util.integrityEscalate()
-		integrity.restoring = true
-		pcall(repair)
-		integrity.restoring = false
-	end)
-end
-
-util.armHubIntegrity = function(cfg)
-	local integrity = util.Integrity
-	util.integrityDisconnect()
-	integrity.armed = false
-	integrity.restoring = false
-	integrity.repairQueued = false
-	integrity.records = {}
-	integrity.knownRootChildren = {}
-	integrity.hardUntil = 0
-	integrity.hardRefreshAt = 0
-	integrity.tamperCount = 0
-	integrity.tamperWindow = os.clock()
-	local gui = cfg.gui
-	if not gui or not gui.Parent then return end
-
-	local dynText = cfg.dynamicText or {}
-	local dynTextColor = cfg.dynamicTextColor or {}
-	local dynTextTrans = cfg.dynamicTextTransparency or {}
-	local dynBg = cfg.dynamicBackground or {}
-	local dynBgTrans = cfg.dynamicBackgroundTransparency or {}
-	local dynSize = cfg.dynamicSize or {}
-	local dynPos = cfg.dynamicPosition or {}
-	local dynRot = cfg.dynamicRotation or {}
-	local dynStrokeColor = cfg.dynamicStrokeColor or {}
-	local dynStrokeTrans = cfg.dynamicStrokeTransparency or {}
-
-	local function capture(obj)
-		local t = { Name = obj.Name }
-		if obj:IsA("ScreenGui") then
-			t.ResetOnSpawn = obj.ResetOnSpawn
-			t.IgnoreGuiInset = obj.IgnoreGuiInset
-			t.DisplayOrder = obj.DisplayOrder
-			t.AutoLocalize = obj.AutoLocalize
-			t.ZIndexBehavior = obj.ZIndexBehavior
-		end
-		if obj:IsA("GuiObject") then
-			t.BorderSizePixel = obj.BorderSizePixel
-			t.ZIndex = obj.ZIndex
-			t.AnchorPoint = obj.AnchorPoint
-			if not dynSize[obj] then t.Size = obj.Size end
-			if not dynPos[obj] then t.Position = obj.Position end
-			if not dynRot[obj] then t.Rotation = obj.Rotation end
-			if not dynBg[obj] then t.BackgroundColor3 = obj.BackgroundColor3 end
-			if not dynBgTrans[obj] then t.BackgroundTransparency = obj.BackgroundTransparency end
-		end
-		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
-			if not dynText[obj] then t.Text = obj.Text end
-			if not dynTextColor[obj] then t.TextColor3 = obj.TextColor3 end
-			if not dynTextTrans[obj] then t.TextTransparency = obj.TextTransparency end
-			t.TextStrokeColor3 = obj.TextStrokeColor3
-			t.TextStrokeTransparency = obj.TextStrokeTransparency
-			t.TextSize = obj.TextSize
-			t.Font = obj.Font
-			t.TextXAlignment = obj.TextXAlignment
-			t.TextYAlignment = obj.TextYAlignment
-			t.TextWrapped = obj.TextWrapped
-			t.TextScaled = obj.TextScaled
-			t.TextTruncate = obj.TextTruncate
-			if obj:IsA("TextButton") then
-				t.AutoButtonColor = obj.AutoButtonColor
-			end
-		end
-		if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
-			t.Image = obj.Image
-			t.ImageColor3 = obj.ImageColor3
-			t.ImageTransparency = obj.ImageTransparency
-			t.ScaleType = obj.ScaleType
-			if obj:IsA("ImageButton") then
-				t.AutoButtonColor = obj.AutoButtonColor
-			end
-		end
-		if obj:IsA("UIStroke") then
-			if not dynStrokeColor[obj] then t.Color = obj.Color end
-			if not dynStrokeTrans[obj] then t.Transparency = obj.Transparency end
-			t.Thickness = obj.Thickness
-			t.LineJoinMode = obj.LineJoinMode
-		end
-		if obj:IsA("UICorner") then t.CornerRadius = obj.CornerRadius end
-		if obj:IsA("UIScale") then t.Scale = obj.Scale end
-		if obj:IsA("UIGradient") then
-			t.Color = obj.Color
-			t.Transparency = obj.Transparency
-			t.Rotation = obj.Rotation
-		end
-		return t
-	end
-
-	local parent = gui.Parent
-	util.integrityWatch(gui, capture(gui), parent)
-	local children = gui:GetChildren()
-	for i = 1, #children do
-		integrity.knownRootChildren[children[i]] = true
-	end
-	util.walk(gui, function(obj)
-		util.integrityWatch(obj, capture(obj), obj.Parent)
-	end)
-
-	integrity.connections[#integrity.connections + 1] = gui.ChildAdded:Connect(function(child)
-		if not integrity.armed or integrity.restoring then return end
-		if not integrity.knownRootChildren[child] then
-			util.integrityEscalate()
-			pcall(function()
-				child:Destroy()
-			end)
-		end
-	end)
-
-	integrity.connections[#integrity.connections + 1] = gui.ChildRemoved:Connect(function(child)
-		if not integrity.armed or integrity.restoring or not integrity.knownRootChildren[child] then return end
-		util.integrityEscalate()
-		util.integrityQueueRepair()
-	end)
-
-	local computed = cfg.computed or {}
-	for i = 1, #computed do
-		local c = computed[i]
-		util.integrityWatchComputed(c.instance, c.properties, c.repair)
-	end
-
-	integrity.refresh = cfg.refresh
-	integrity.armed = true
-	util.integrityRepairAll()
-
-	pcall(function()
-		RunService:UnbindFromRenderStep(integrity.guardName)
-	end)
-
-	RunService:BindToRenderStep(integrity.guardName, Enum.RenderPriority.Last.Value + 1000, function()
-		local now = os.clock()
-		if not integrity.armed or integrity.restoring or now > integrity.hardUntil then return end
-		integrity.restoring = true
-		for i = 1, #integrity.records do
-			util.integrityRepairRecord(integrity.records[i])
-		end
-		if integrity.refresh and now >= integrity.hardRefreshAt then
-			integrity.hardRefreshAt = now + 0.05
-			pcall(integrity.refresh)
-		end
-		integrity.restoring = false
-	end)
 end
 
 util.findModule = function(name)
@@ -350,23 +85,38 @@ util.findModule = function(name)
 end
 
 local Assets = nil
-local data = ReplicatedStorage:FindFirstChild("Data")
-data = data and data:FindFirstChild("Assets") or ReplicatedStorage:FindFirstChild("Assets")
-if data and data:IsA("ModuleScript") then
-	local ok, result = pcall(require, data)
-	if ok then Assets = result end
-end
+pcall(function()
+	local data = ReplicatedStorage:FindFirstChild("Data")
+	local assetsMod = data and data:FindFirstChild("Assets") or ReplicatedStorage:FindFirstChild("Assets")
+	if assetsMod and assetsMod:IsA("ModuleScript") then
+		local ok, result = pcall(require, assetsMod)
+		if ok then Assets = result end
+	end
+end)
 Assets = Assets or util.findModule("Assets")
 
-require(ReplicatedStorage:WaitForChild("Client"):WaitForChild("EggState"))
-require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Remotes"))
-require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Modules"):WaitForChild("RagdollJoints"))
-require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Util"):WaitForChild("AreaEggSlotIdentity"))
-local AreaEggCycle = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Util"):WaitForChild("AreaEggCycle"))
-require(ReplicatedStorage:WaitForChild("Data"):WaitForChild("AreaEggResetCycle"))
-local Rarity = require(ReplicatedStorage:WaitForChild("Data"):WaitForChild("Rarity"))
+local AreaEggCycle, Rarity, Mutations, AssetViewport
+pcall(function()
+	AreaEggCycle = require(ReplicatedStorage:WaitForChild("Shared", 5):WaitForChild("Util", 5):WaitForChild("AreaEggCycle", 5))
+end)
+pcall(function()
+	Rarity = require(ReplicatedStorage:WaitForChild("Data", 5):WaitForChild("Rarity", 5))
+end)
+pcall(function()
+	Mutations = require(ReplicatedStorage:WaitForChild("Shared", 5):WaitForChild("Modules", 5):WaitForChild("Mutations", 5))
+end)
+pcall(function()
+	AssetViewport = require(ReplicatedStorage:WaitForChild("Client", 5):WaitForChild("AssetViewport", 5))
+end)
+pcall(function()
+	require(ReplicatedStorage:WaitForChild("Client", 3):WaitForChild("EggState", 3))
+end)
+pcall(function()
+	require(ReplicatedStorage:WaitForChild("Shared", 3):WaitForChild("Remotes", 3))
+end)
 
 util.isDaytime = function()
+	if not AreaEggCycle then return true end
 	local ok, result = pcall(function()
 		return AreaEggCycle.IsNightPhase(workspace:GetServerTimeNow())
 	end)
@@ -374,8 +124,7 @@ util.isDaytime = function()
 end
 
 util.isStartWallOpen = function()
-	local objects = workspace:FindFirstChild("OBJECTS")
-	local areas = objects and objects:FindFirstChild("Areas")
+	local areas = getAreas()
 	if not areas then return true end
 	local wallStartVisual = areas:FindFirstChild("WallStartVisual")
 	if wallStartVisual and wallStartVisual:IsA("BasePart") and wallStartVisual.Size.Y > 0.25 then
@@ -396,12 +145,11 @@ util.rarityConfigCache = {}
 util.rarityColorCache = {}
 
 util.getOfficialRarityConfig = function(arg)
+	if not Rarity or not Rarity.Rarities then return nil end
 	local key = string.lower(tostring(arg or "")):gsub("%s+", "")
 	local cached = util.rarityConfigCache[key]
-	if cached ~= nil then
-		return cached ~= false and cached or nil
-	end
-	for k, rarity in pairs(Rarity.Rarities or {}) do
+	if cached ~= nil then return cached ~= false and cached or nil end
+	for k, rarity in pairs(Rarity.Rarities) do
 		local k1 = string.lower(tostring(k)):gsub("%s+", "")
 		local k2 = string.lower(tostring(type(rarity) == "table" and rarity.DisplayName or "")):gsub("%s+", "")
 		if k1 == key or k2 == key then
@@ -429,9 +177,6 @@ util.getOfficialRarityColor = function(arg)
 	return color
 end
 
-local Mutations = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Modules"):WaitForChild("Mutations"))
-local AssetViewport = require(ReplicatedStorage:WaitForChild("Client"):WaitForChild("AssetViewport"))
-
 local CFG = {
 	REFRESH_INTERVAL = 0.5,
 	SPAM_INTERVAL = 0.01,
@@ -448,7 +193,6 @@ local CFG = {
 	GROUND_CLEARANCE = 4,
 	RAYCAST_UP = 100,
 	RAYCAST_DOWN = 300,
-	JUMP_ANIMATION_ID = "rbxassetid://125750702",
 }
 
 local state = {
@@ -478,7 +222,6 @@ local state = {
 	moveTarget = nil,
 	onArrive = nil,
 	lastSpamTime = 0,
-	lastProtectTime = 0,
 }
 
 local rarityOptions = {
@@ -504,23 +247,27 @@ util.eggMatchesRarityFilter = function(egg)
 	return state.rarityFilter[util.normalizeRarityKey(egg.RarityName)] == true
 end
 
-local characterRef = nil
-local humanoid = nil
-local humanoidRootPart = nil
-workspace:WaitForChild("OBJECTS"):WaitForChild("Areas"):WaitForChild("StartArea")
-ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Trails")
+local characterRef, humanoid, humanoidRootPart
+local activeTween, tweenConn, savedWalkSpeed
+local beam, att0, att1
+local bossModel, bossRoot, bossOffset, bossY, bossSource, bossSourceParent, bossWeld
+local bossIdleTrack, bossWalkTrack, bossRiderTrack, bossSounds, bossAnimConn
+bossSounds = {}
 
-local fakeHum = nil
-local originalHum = nil
-local animateRef = nil
-local healthRef = nil
-local originalChar = nil
-local jumpTrack = nil
-local jumpAnim = nil
-local originalBreakJoints = nil
-local activeTween = nil
-local tweenConn = nil
-local savedWalkSpeed = nil
+local bossOffsets = {
+	["Abyss Ocean"] = { X = 0, Y = 9.4, Z = 4 },
+	["Cherry Blossom"] = { X = 0, Y = 7.5, Z = -1 },
+	["Enchanted Forest"] = { X = 0, Y = 2, Z = 0.5 },
+	Cosmic = { X = 0, Y = 11, Z = 3 },
+	Desert = { X = 0, Y = 2, Z = 2 },
+	Forest = { X = 0, Y = 2, Z = 0.5 },
+	Jungle = { X = 0, Y = 5, Z = -0.5 },
+	Lake = { X = 0, Y = 2, Z = 0 },
+	Prehistoric = { X = 0, Y = 22, Z = -12 },
+	Snow = { X = 0, Y = 1.5, Z = -0.5 },
+	Volcano = { X = 0, Y = 8, Z = -2 },
+	["Titan Temple"] = { X = 0, Y = 15, Z = 3.5 },
+}
 
 util.restoreWalkSpeed = function()
 	local char = localPlayer.Character
@@ -532,22 +279,16 @@ util.restoreWalkSpeed = function()
 end
 
 util.isPlayerInGroundArea = function(hrp)
-	local ground = workspace:FindFirstChild("OBJECTS")
-		and workspace.OBJECTS:FindFirstChild("Areas")
-		and workspace.OBJECTS.Areas:FindFirstChild("Ground")
-	if not ground then return false end
+	local ground = getGround()
+	if not ground or not hrp then return false end
 	if ground:IsA("Model") then
 		local bb, size = ground:GetBoundingBox()
-		local localPos = bb:PointToObjectSpace(hrp.Position)
-		return math.abs(localPos.X) <= size.X / 2
-			and math.abs(localPos.Y) <= size.Y / 2 + 20
-			and math.abs(localPos.Z) <= size.Z / 2
+		local lp = bb:PointToObjectSpace(hrp.Position)
+		return math.abs(lp.X) <= size.X / 2 and math.abs(lp.Y) <= size.Y / 2 + 20 and math.abs(lp.Z) <= size.Z / 2
 	end
 	if ground:IsA("BasePart") then
-		local localPos = ground.CFrame:PointToObjectSpace(hrp.Position)
-		return math.abs(localPos.X) <= ground.Size.X / 2
-			and math.abs(localPos.Y) <= ground.Size.Y / 2 + 20
-			and math.abs(localPos.Z) <= ground.Size.Z / 2
+		local lp = ground.CFrame:PointToObjectSpace(hrp.Position)
+		return math.abs(lp.X) <= ground.Size.X / 2 and math.abs(lp.Y) <= ground.Size.Y / 2 + 20 and math.abs(lp.Z) <= ground.Size.Z / 2
 	end
 	return false
 end
@@ -562,23 +303,19 @@ end
 
 util.getGroundAdjustedPosition = function(pos)
 	if typeof(pos) ~= "Vector3" then return pos end
-	local clearance = tonumber(CFG.GROUND_CLEARANCE) or 4
+	local clearance = CFG.GROUND_CLEARANCE or 4
 	local char = localPlayer.Character or characterRef
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	local lift
+	local lift = clearance
 	if hrp and hum then
 		lift = math.max(clearance, hrp.Size.Y  0.5 + math.max(tonumber(hum.HipHeight) or 0, 0) + 0.2)
-	else
-		lift = clearance
 	end
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.IgnoreWater = true
 	local filter = {}
-	if characterRef and characterRef.Parent then
-		table.insert(filter, characterRef)
-	end
+	if characterRef and characterRef.Parent then table.insert(filter, characterRef) end
 	local origin = pos + Vector3.new(0, CFG.RAYCAST_UP, 0)
 	local dir = Vector3.new(0, -(CFG.RAYCAST_UP + CFG.RAYCAST_DOWN), 0)
 	for _ = 1, 8 do
@@ -595,27 +332,17 @@ util.getGroundAdjustedPosition = function(pos)
 end
 
 util.stopCurrentTween = function(dropEgg)
-	if tweenConn then
-		tweenConn:Disconnect()
-		tweenConn = nil
-	end
-	if activeTween then
-		activeTween:Cancel()
-		activeTween = nil
-	end
+	if tweenConn then tweenConn:Disconnect() tweenConn = nil end
+	if activeTween then activeTween:Cancel() activeTween = nil end
 	local char = localPlayer.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if hrp then
-		hrp.AssemblyLinearVelocity = Vector3.zero
-	end
+	if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
 	util.restoreWalkSpeed()
-	if dropEgg then
+	if dropEgg and remotes.AskFieldEggDrop then
 		task.spawn(function()
 			task.wait(0.05)
 			pcall(function()
-				if remotes.AskFieldEggDrop then
-					remotes.AskFieldEggDrop:InvokeServer({ Reason = "PlayerRequest" })
-				end
+				remotes.AskFieldEggDrop:InvokeServer({ Reason = "PlayerRequest" })
 			end)
 		end)
 	end
@@ -637,10 +364,8 @@ util.tweenToTarget = function(targetPos, faceForward)
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not hrp then return end
-	if util.isPlayerInGroundArea(hrp) then
-		util.unequipTreadmill()
-	end
-	local speed = tonumber(CFG.TWEEN_SPEED) or 500
+	if util.isPlayerInGroundArea(hrp) then util.unequipTreadmill() end
+	local speed = CFG.TWEEN_SPEED or 500
 	util.stopCurrentTween(false)
 	if hum then
 		if hum.WalkSpeed > 0 then savedWalkSpeed = hum.WalkSpeed end
@@ -652,7 +377,6 @@ util.tweenToTarget = function(targetPos, faceForward)
 			if onDone then onDone() end
 			return
 		end
-		local info = TweenInfo.new(dist / speed, Enum.EasingStyle.Linear)
 		local cf = CFrame.new(pos)
 		if faceForward then
 			local look = Vector3.new(pos.X - hrp.Position.X, 0, pos.Z - hrp.Position.Z)
@@ -660,15 +384,12 @@ util.tweenToTarget = function(targetPos, faceForward)
 				cf = CFrame.lookAt(pos, pos + look.Unit)
 			end
 		end
-		local tween = TweenService:Create(hrp, info, { CFrame = cf })
+		local tween = TweenService:Create(hrp, TweenInfo.new(dist / speed, Enum.EasingStyle.Linear), { CFrame = cf })
 		activeTween = tween
 		tweenConn = tween.Completed:Connect(function(ps)
 			if activeTween == tween then
 				activeTween = nil
-				if tweenConn then
-					tweenConn:Disconnect()
-					tweenConn = nil
-				end
+				if tweenConn then tweenConn:Disconnect() tweenConn = nil end
 				if ps == Enum.PlaybackState.Completed then
 					hrp.AssemblyLinearVelocity = Vector3.zero
 					hrp.AssemblyAngularVelocity = Vector3.zero
@@ -679,12 +400,11 @@ util.tweenToTarget = function(targetPos, faceForward)
 		end)
 		tween:Play()
 	end
-	local waypoint = CFG.WAYPOINT
-	local nearWaypoint = (targetPos - waypoint).Magnitude < 2
-	local wp = util.getGroundAdjustedPosition(waypoint)
 	local dest = faceForward and targetPos or util.getGroundAdjustedPosition(targetPos)
-	if CFG.USE_GROUND_DETECTION and not faceForward and util.isPlayerInGroundArea(hrp) and not nearWaypoint then
-		moveTo(wp, function()
+	local waypoint = CFG.WAYPOINT
+	local nearWp = (targetPos - waypoint).Magnitude < 2
+	if CFG.USE_GROUND_DETECTION and not faceForward and util.isPlayerInGroundArea(hrp) and not nearWp then
+		moveTo(util.getGroundAdjustedPosition(waypoint), function()
 			moveTo(dest, util.completeMove)
 		end)
 	else
@@ -711,219 +431,11 @@ util.unequipAllTools = function()
 	task.spawn(function()
 		pcall(function()
 			local char = localPlayer.Character or characterRef
-			if not char then return end
-			local hum = char:FindFirstChildOfClass("Humanoid")
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
 			if hum then hum:UnequipTools() end
 		end)
 	end)
 end
-
-util.applyAntiRagdoll = function(char, hum)
-	if not char or not hum then return end
-	hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-	hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-	hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
-	local motors = util.motorCache
-	if motors then
-		for i = 1, #motors do
-			local m = motors[i]
-			if m and m.Parent and m:IsDescendantOf(char) then
-				m.Enabled = true
-			end
-		end
-	else
-		util.walk(char, function(obj)
-			if obj:IsA("Motor6D") then obj.Enabled = true end
-		end)
-	end
-end
-
-util.createZombieHumanoidClone = function(src, autoRotate)
-	if not src then return nil end
-	local clone = src:Clone()
-	clone.Name = "Humanoid"
-	clone.BreakJointsOnDeath = false
-	clone:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
-	clone:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-	clone:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-	clone:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
-	clone.Health = clone.MaxHealth
-	clone.HipHeight = src.HipHeight
-	clone.PlatformStand = false
-	clone.Sit = false
-	clone.AutoRotate = autoRotate == true
-	return clone
-end
-
-util.applyZombieDesync = function(char)
-	if not char then return nil end
-	if fakeHum and fakeHum.Parent == char then return fakeHum end
-	savedWalkSpeed = nil
-	local hum = char:WaitForChild("Humanoid", 5)
-	if not hum then return nil end
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	local cf = hrp and hrp.CFrame or nil
-	local hip = hum.HipHeight
-	originalHum = hum
-	originalBreakJoints = hum.BreakJointsOnDeath
-	originalChar = char
-	healthRef = char:FindFirstChild("Health")
-	animateRef = char:FindFirstChild("Animate")
-	local clone = util.createZombieHumanoidClone(hum, true)
-	if not clone then return nil end
-	if animateRef then animateRef.Parent = nil end
-	local animator = clone:FindFirstChildOfClass("Animator")
-	if not animator then
-		animator = Instance.new("Animator")
-		animator.Parent = clone
-	end
-	if CFG.JUMP_ANIMATION_ID and CFG.JUMP_ANIMATION_ID ~= "" then
-		pcall(function()
-			jumpAnim = Instance.new("Animation")
-			jumpAnim.AnimationId = CFG.JUMP_ANIMATION_ID
-			jumpTrack = animator:LoadAnimation(jumpAnim)
-			clone.Jumping:Connect(function(active)
-				if active and jumpTrack then jumpTrack:Play() end
-			end)
-		end)
-	end
-	hum.Parent = nil
-	clone.Parent = char
-	clone.HipHeight = hip
-	fakeHum = clone
-	humanoid = clone
-	if animateRef then
-		if not pcall(function()
-			local c = animateRef:Clone()
-			c.Name = "Animate"
-			c.Parent = char
-			c.Disabled = false
-		end) then
-			animateRef.Parent = char
-			animateRef.Disabled = false
-		end
-	end
-	util.applyAntiRagdoll(char, clone)
-	if hrp and hrp.Parent then
-		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.AssemblyAngularVelocity = Vector3.zero
-		if cf then hrp.CFrame = cf end
-	end
-	local cam = workspace.CurrentCamera
-	if cam then
-		cam.CameraType = Enum.CameraType.Custom
-		cam.CameraSubject = clone
-	end
-	return clone
-end
-
-util.restoreOriginalHumanoid = function()
-	local char = originalChar or localPlayer.Character
-	if not char then return end
-	if not originalHum then
-		fakeHum = nil
-		humanoid = char:FindFirstChildOfClass("Humanoid")
-		local cam = workspace.CurrentCamera
-		if cam and humanoid then
-			cam.CameraType = Enum.CameraType.Custom
-			cam.CameraSubject = humanoid
-		end
-		return
-	end
-	if jumpTrack then pcall(function() jumpTrack:Stop(0) end) end
-	if jumpAnim then pcall(function() jumpAnim:Destroy() end) end
-	jumpTrack = nil
-	jumpAnim = nil
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	local cf = hrp and hrp.CFrame or nil
-	local current = char:FindFirstChildOfClass("Humanoid")
-	if current and current ~= originalHum then current:Destroy() end
-	if originalHum then
-		originalHum.Parent = char
-		originalHum.PlatformStand = false
-		originalHum.AutoRotate = true
-		originalHum.Sit = false
-		pcall(function()
-			originalHum:ChangeState(Enum.HumanoidStateType.GettingUp)
-		end)
-		humanoid = originalHum
-		fakeHum = nil
-	end
-	if hrp and hrp.Parent then
-		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.AssemblyAngularVelocity = Vector3.zero
-		if cf then hrp.CFrame = cf end
-	end
-	local anim = char:FindFirstChild("Animate")
-	if anim and anim ~= animateRef then anim:Destroy() end
-	if animateRef then
-		animateRef.Parent = char
-		animateRef.Disabled = false
-	end
-	if healthRef then healthRef.Parent = char end
-	if originalHum and originalBreakJoints ~= nil then
-		originalHum.BreakJointsOnDeath = originalBreakJoints
-	end
-	local cam = workspace.CurrentCamera
-	if cam and humanoid then cam.CameraSubject = humanoid end
-	originalChar = nil
-	originalHum = nil
-	animateRef = nil
-	healthRef = nil
-	originalBreakJoints = nil
-end
-
-local ragdollTick = 0
-RunService.Heartbeat:Connect(function(dt)
-	ragdollTick += dt
-	if ragdollTick < 0.1 then return end
-	ragdollTick = 0
-	if localPlayer.Character and fakeHum then
-		local motors = util.motorCache
-		if motors then
-			for i = 1, #motors do
-				local m = motors[i]
-				if m and m.Parent and not m.Enabled then
-					m.Enabled = true
-				end
-			end
-		end
-		local st = fakeHum:GetState()
-		if st == Enum.HumanoidStateType.Ragdoll or st == Enum.HumanoidStateType.FallingDown then
-			fakeHum:ChangeState(Enum.HumanoidStateType.GettingUp)
-		end
-	end
-end)
-
-local guardAreas = workspace:WaitForChild("OBJECTS"):WaitForChild("Areas"):WaitForChild("GuardAreas")
-guardAreas:WaitForChild("Forest")
-
-local bossOffsets = {
-	["Abyss Ocean"] = { X = 0, Y = 9.4, Z = 4 },
-	["Cherry Blossom"] = { X = 0, Y = 7.5, Z = -1 },
-	Cosmic = { X = 0, Y = 11, Z = 3.000015 },
-	Desert = { X = -6.1e-05, Y = 2, Z = 2 },
-	Forest = { X = 0, Y = 2, Z = 0.500061 },
-	Jungle = { X = 0, Y = 5.000008, Z = -0.500031 },
-	Lake = { X = 0, Y = 2, Z = 0 },
-	Prehistoric = { X = 0, Y = 22, Z = -12 },
-	Snow = { X = 0, Y = 1.5, Z = -0.5 },
-	Volcano = { X = -6.1e-05, Y = 8, Z = -2 },
-	["Titan Temple"] = { X = 0, Y = 15, Z = 3.5 },
-}
-
-local bossModel = nil
-local bossRoot = nil
-local bossOffset = nil
-local bossY = nil
-local bossSource = nil
-local bossSourceParent = nil
-local bossWeld = nil
-local bossIdleTrack = nil
-local bossWalkTrack = nil
-local bossRiderTrack = nil
-local bossSounds = {}
-local bossAnimConn = nil
 
 util.getAreaCenter = function(area)
 	if not area then return nil end
@@ -939,19 +451,17 @@ util.isPositionInsideArea = function(pos, area)
 	if area:IsA("Model") then
 		bb, size = area:GetBoundingBox()
 	elseif area:IsA("BasePart") then
-		bb = area.CFrame
-		size = area.Size
+		bb, size = area.CFrame, area.Size
 	else
 		return false
 	end
-	local localPos = bb:PointToObjectSpace(pos)
-	return math.abs(localPos.X) <= size.X / 2
-		and math.abs(localPos.Z) <= size.Z / 2
-		and math.abs(localPos.Y) <= size.Y / 2 + 100
+	local lp = bb:PointToObjectSpace(pos)
+	return math.abs(lp.X) <= size.X / 2 and math.abs(lp.Z) <= size.Z / 2 and math.abs(lp.Y) <= size.Y / 2 + 100
 end
 
 util.getBossAreaFromEgg = function(egg)
-	if not egg then return nil end
+	local guardAreas = getGuardAreas()
+	if not egg or not guardAreas then return nil end
 	local areaName = egg.AreaName or egg.Area or egg.World or egg.Biome
 	if type(areaName) == "string" and guardAreas:FindFirstChild(areaName) then
 		return areaName
@@ -960,9 +470,7 @@ util.getBossAreaFromEgg = function(egg)
 	if typeof(pos) ~= "Vector3" then return nil end
 	local closestDist, closestName = nil, nil
 	for _, child in ipairs(guardAreas:GetChildren()) do
-		if util.isPositionInsideArea(pos, child) then
-			return child.Name
-		end
+		if util.isPositionInsideArea(pos, child) then return child.Name end
 		local center = util.getAreaCenter(child)
 		if center then
 			local dist = (Vector3.new(center.X, 0, center.Z) - Vector3.new(pos.X, 0, pos.Z)).Magnitude
@@ -976,51 +484,51 @@ util.getBossAreaFromEgg = function(egg)
 end
 
 util.stopBossAnimations = function()
-	if bossAnimConn then
-		bossAnimConn:Disconnect()
-		bossAnimConn = nil
-	end
+	if bossAnimConn then bossAnimConn:Disconnect() bossAnimConn = nil end
 	if bossIdleTrack then pcall(function() bossIdleTrack:Stop(0.15) end) end
 	if bossWalkTrack then pcall(function() bossWalkTrack:Stop(0.15) end) end
 	if bossRiderTrack then pcall(function() bossRiderTrack:Stop(0.15) end) end
 	for _, entry in ipairs(bossSounds) do
-		local sound = entry.Sound
-		if sound and sound.Parent then
+		local s = entry.Sound
+		if s and s.Parent then
 			pcall(function()
-				sound:Stop()
-				sound.Looped = entry.Looped
+				s:Stop()
+				s.Looped = entry.Looped
 			end)
 		end
 	end
 	bossSounds = {}
-	bossIdleTrack = nil
-	bossWalkTrack = nil
-	bossRiderTrack = nil
+	bossIdleTrack, bossWalkTrack, bossRiderTrack = nil, nil, nil
 end
 
 util.cleanupBossMount = function()
 	util.stopBossAnimations()
-	if bossWeld then
-		bossWeld:Destroy()
-		bossWeld = nil
-	end
-	if bossModel then
-		bossModel:Destroy()
-		bossModel = nil
-	end
-	if bossSource and bossSourceParent then
-		bossSource.Parent = bossSourceParent
-	end
-	bossSource = nil
-	bossSourceParent = nil
-	bossRoot = nil
-	bossOffset = nil
-	bossY = nil
-	local hum = fakeHum or (characterRef and characterRef:FindFirstChildOfClass("Humanoid"))
-	if hum and hum.Parent then
+	if bossWeld then bossWeld:Destroy() bossWeld = nil end
+	if bossModel then bossModel:Destroy() bossModel = nil end
+	if bossSource and bossSourceParent then bossSource.Parent = bossSourceParent end
+	bossSource, bossSourceParent, bossRoot, bossOffset, bossY = nil, nil, nil, nil, nil
+	local hum = characterRef and characterRef:FindFirstChildOfClass("Humanoid")
+	if hum then
 		hum.PlatformStand = false
 		hum.AutoRotate = true
 	end
+end
+
+util.getGroundDirectionFrom = function(from)
+	local ground = getGround()
+	if not ground then return nil end
+	local pos
+	if ground:IsA("Model") then
+		pos = ground:GetPivot().Position
+	elseif ground:IsA("BasePart") then
+		pos = ground.Position
+	else
+		local part = ground:FindFirstChildWhichIsA("BasePart", true)
+		pos = part and part.Position
+	end
+	if not pos then return nil end
+	local dir = Vector3.new(pos.X - from.X, 0, pos.Z - from.Z)
+	return dir.Magnitude > 0.01 and dir.Unit or nil
 end
 
 util.loadBossMovementSounds = function(model)
@@ -1036,22 +544,20 @@ util.loadBossMovementSounds = function(model)
 		end
 	end)
 	if #preferred == 0 then preferred = all end
-	for _, sound in ipairs(preferred) do
-		table.insert(bossSounds, { Sound = sound, Looped = sound.Looped })
-		sound.Looped = true
+	for _, s in ipairs(preferred) do
+		table.insert(bossSounds, { Sound = s, Looped = s.Looped })
+		s.Looped = true
 	end
 end
 
 util.setBossMovementSounds = function(playing)
 	for _, entry in ipairs(bossSounds) do
-		local sound = entry.Sound
-		if sound and sound.Parent then
+		local s = entry.Sound
+		if s and s.Parent then
 			if playing then
-				if not sound.IsPlaying then
-					pcall(function() sound:Play() end)
-				end
-			elseif sound.IsPlaying then
-				pcall(function() sound:Stop() end)
+				if not s.IsPlaying then pcall(function() s:Play() end) end
+			elseif s.IsPlaying then
+				pcall(function() s:Stop() end)
 			end
 		end
 	end
@@ -1062,14 +568,16 @@ util.loadBossAnimations = function(model, areaName)
 	local controller = model:FindFirstChildWhichIsA("AnimationController", true)
 	if not controller then
 		controller = Instance.new("AnimationController")
-		controller.Name = "AnimationController"
 		controller.Parent = model:FindFirstChild("Model") or model
 	end
 	local animator = controller:FindFirstChildWhichIsA("Animator") or Instance.new("Animator")
 	animator.Parent = controller
-	local idleId, walkId = nil, nil
+	local idleId, walkId
 	pcall(function()
-		local cfg = ReplicatedStorage.Data.Guards.Configs:FindFirstChild(areaName)
+		local data = ReplicatedStorage:FindFirstChild("Data")
+		local guards = data and data:FindFirstChild("Guards")
+		local configs = guards and guards:FindFirstChild("Configs")
+		local cfg = configs and configs:FindFirstChild(areaName)
 		if cfg then
 			local module = require(cfg)
 			idleId = module.IdleAnimation and module.IdleAnimation.AnimationId
@@ -1080,9 +588,7 @@ util.loadBossAnimations = function(model, areaName)
 		if not id then return nil end
 		local anim = Instance.new("Animation")
 		anim.AnimationId = id
-		local ok, track = pcall(function()
-			return animator:LoadAnimation(anim)
-		end)
+		local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
 		if not ok or not track then return nil end
 		track.Looped = true
 		track.Priority = priority
@@ -1091,21 +597,18 @@ util.loadBossAnimations = function(model, areaName)
 	bossIdleTrack = loadTrack(idleId, Enum.AnimationPriority.Idle)
 	bossWalkTrack = loadTrack(walkId, Enum.AnimationPriority.Movement)
 	if bossIdleTrack then bossIdleTrack:Play(0.15) end
-	local hum = fakeHum or (characterRef and characterRef:FindFirstChildOfClass("Humanoid"))
+	local hum = characterRef and characterRef:FindFirstChildOfClass("Humanoid")
 	if hum then
 		local anim = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator")
 		anim.Parent = hum
 		local a = Instance.new("Animation")
 		a.AnimationId = "rbxassetid://2506281703"
-		local ok, track = pcall(function()
-			return anim:LoadAnimation(a)
-		end)
+		local ok, track = pcall(function() return anim:LoadAnimation(a) end)
 		if ok and track then
 			bossRiderTrack = track
 			bossRiderTrack.Looped = true
 			bossRiderTrack.Priority = Enum.AnimationPriority.Action4
 			bossRiderTrack:Play(0.15)
-			bossRiderTrack:AdjustWeight(1, 0.1)
 		end
 	end
 	local t = 0
@@ -1129,46 +632,22 @@ util.loadBossAnimations = function(model, areaName)
 		else
 			util.setBossMovementSounds(moving)
 		end
-		if bossRiderTrack and not bossRiderTrack.IsPlaying then
-			bossRiderTrack:Play(0.1)
-			bossRiderTrack:AdjustWeight(1, 0.1)
-		end
 	end)
-end
-
-util.getGroundDirectionFrom = function(from)
-	local ground = workspace:FindFirstChild("OBJECTS")
-		and workspace.OBJECTS:FindFirstChild("Areas")
-		and workspace.OBJECTS.Areas:FindFirstChild("Ground")
-	if not ground then return nil end
-	local pos
-	if ground:IsA("Model") then
-		pos = ground:GetPivot().Position
-	elseif ground:IsA("BasePart") then
-		pos = ground.Position
-	else
-		local part = ground:FindFirstChildWhichIsA("BasePart", true)
-		pos = part and part.Position
-	end
-	if not pos then return nil end
-	local dir = Vector3.new(pos.X - from.X, 0, pos.Z - from.Z)
-	return dir.Magnitude > 0.01 and dir.Unit or nil
 end
 
 util.spawnBossForEgg = function(egg)
 	util.cleanupBossMount()
 	if not humanoidRootPart or not humanoidRootPart.Parent then return nil end
+	local guardAreas = getGuardAreas()
+	if not guardAreas then return nil end
 	local areaName = util.getBossAreaFromEgg(egg)
-	local guardFolder = areaName and guardAreas:FindFirstChild(areaName)
-	local guard = guardFolder and guardFolder:FindFirstChild("Guard")
+	local folder = areaName and guardAreas:FindFirstChild(areaName)
+	local guard = folder and folder:FindFirstChild("Guard")
 	if not guard then
 		warn("Guard not found for egg area:", tostring(areaName))
 		return nil
 	end
-	local primary = guard.PrimaryPart
-		or guard:FindFirstChild("HumanoidRootPart", true)
-		or guard:FindFirstChild("Root", true)
-		or guard:FindFirstChildWhichIsA("BasePart", true)
+	local primary = guard.PrimaryPart or guard:FindFirstChild("HumanoidRootPart", true) or guard:FindFirstChild("Root", true) or guard:FindFirstChildWhichIsA("BasePart", true)
 	if not primary then return nil end
 	bossY = primary.Position.Y
 	local clone = guard:Clone()
@@ -1176,15 +655,11 @@ util.spawnBossForEgg = function(egg)
 	bossSource = guard
 	bossSourceParent = guard.Parent
 	guard.Parent = nil
-	local root = clone.PrimaryPart
-		or clone:FindFirstChild("HumanoidRootPart", true)
-		or clone:FindFirstChild("Root", true)
-		or clone:FindFirstChildWhichIsA("BasePart", true)
+	local root = clone.PrimaryPart or clone:FindFirstChild("HumanoidRootPart", true) or clone:FindFirstChild("Root", true) or clone:FindFirstChildWhichIsA("BasePart", true)
 	if not root then
 		clone:Destroy()
 		if bossSource and bossSourceParent then bossSource.Parent = bossSourceParent end
-		bossSource = nil
-		bossSourceParent = nil
+		bossSource, bossSourceParent = nil, nil
 		return nil
 	end
 	clone.PrimaryPart = root
@@ -1198,7 +673,8 @@ util.spawnBossForEgg = function(egg)
 		end
 	end)
 	local look = util.getGroundDirectionFrom(humanoidRootPart.Position) or humanoidRootPart.CFrame.LookVector
-	local unit = Vector3.new(look.X, 0, look.Z).Unit
+	local unit = Vector3.new(look.X, 0, look.Z)
+	unit = unit.Magnitude > 0.01 and unit.Unit or Vector3.new(0, 0, -1)
 	local spawnPos = Vector3.new((humanoidRootPart.Position + unit  8).X, bossY, (humanoidRootPart.Position + unit  8).Z)
 	clone:PivotTo(CFrame.lookAt(spawnPos, spawnPos + unit))
 	local dy = bossY - root.Position.Y
@@ -1212,13 +688,12 @@ util.spawnBossForEgg = function(egg)
 	humanoidRootPart.CFrame = root.CFrame  CFrame.new(off.X, off.Y, off.Z)
 	root.Anchored = false
 	bossWeld = Instance.new("WeldConstraint")
-	bossWeld.Name = "BossRiderWeld"
 	bossWeld.Part0 = humanoidRootPart
 	bossWeld.Part1 = root
 	bossWeld.Parent = humanoidRootPart
 	bossModel = clone
 	bossRoot = root
-	local hum = fakeHum or (characterRef and characterRef:FindFirstChildOfClass("Humanoid"))
+	local hum = characterRef and characterRef:FindFirstChildOfClass("Humanoid")
 	if hum then
 		hum.PlatformStand = false
 		hum.AutoRotate = false
@@ -1229,31 +704,99 @@ end
 
 util.getBossDeliveryPosition = function(pos)
 	if typeof(pos) ~= "Vector3" then return pos end
-	local off = bossOffset
-	if not off then return pos end
+	if not bossOffset then return pos end
 	local base = Vector3.new(pos.X, bossY or pos.Y, pos.Z)
-	return (CFrame.lookAt(base, base + (util.getGroundDirectionFrom(base) or Vector3.new(0, 0, -1)))  CFrame.new(off.X, off.Y, off.Z)).Position
+	return (CFrame.lookAt(base, base + (util.getGroundDirectionFrom(base) or Vector3.new(0, 0, -1)))  CFrame.new(bossOffset.X, bossOffset.Y, bossOffset.Z)).Position
 end
 
--- UI
+util.getGroundPosition = function()
+	local ground = getGround()
+	if not ground then return nil end
+	if ground:IsA("BasePart") then
+		return ground.Position + Vector3.new(0, ground.Size.Y  0.5 + CFG.GROUND_OFFSET, 0)
+	end
+	if ground:IsA("Model") then
+		local pivot = ground:GetPivot()
+		local _, size = ground:GetBoundingBox()
+		return pivot.Position + Vector3.new(0, size.Y  0.5 + CFG.GROUND_OFFSET, 0)
+	end
+	local part = ground:FindFirstChildWhichIsA("BasePart", true)
+	if part then
+		return part.Position + Vector3.new(0, part.Size.Y  0.5 + CFG.GROUND_OFFSET, 0)
+	end
+	return nil
+end
+
+util.getScaleMultiplier = function(scaleVal)
+	local n = tonumber(scaleVal) or 1
+	if n <= 5 then return n ^ 1.85 end
+	return (n / 5) ^ 1.2  19.637875755794113
+end
+
+util.getEggData = function(record)
+	if not Assets or not Assets.Directory or not record then return nil end
+	local dir = Assets.Directory[record.AssetCategory]
+	if not dir then return nil end
+	local rate = tonumber(dir.EarningRate) or 0
+	local scaleVal = tonumber(record.AssetScale) or 1
+	local mutMul = 1
+	if record.Mutations and #record.Mutations > 0 and Mutations and type(Mutations.EarningsFor) == "function" then
+		local ok, result = pcall(Mutations.EarningsFor, record.Mutations)
+		if ok then mutMul = tonumber(result) or 1 end
+	end
+	local gen = rate  util.getScaleMultiplier(scaleVal)  mutMul
+	local color = Color3.fromRGB(170, 190, 178)
+	local rarityNum, rarityName = 0, ""
+	if dir.Rarity then
+		rarityNum = dir.Rarity.RarityNumber or 0
+		rarityName = dir.Rarity.DisplayName or dir.Rarity.Name or ""
+		color = util.getOfficialRarityColor(rarityName)
+	end
+	if not record.BottomCFrame then return nil end
+	return {
+		Uid = record.Uid,
+		Category = record.AssetCategory,
+		Name = dir.DisplayName or record.AssetCategory,
+		Generation = math.round(gen),
+		Position = record.BottomCFrame.Position,
+		BottomCFrame = record.BottomCFrame,
+		Rarity = rarityNum,
+		RarityName = rarityName,
+		RarityColor = color,
+	}
+end
+
+util.formatNumber = function(n)
+	n = tonumber(n) or 0
+	local function trim(x)
+		return (string.format("%.2f", x):gsub("(%..-)0+\( ", "%1"):gsub("%. \)", ""))
+	end
+	local abs = math.abs(n)
+	for _, pair in ipairs({ { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }) do
+		if abs >= pair[1] then return trim(n / pair[1]) .. pair[2] end
+	end
+	return tostring(math.floor(n + 0.5))
+end
+
+-- UI first so frame always shows
 local PREFIX = "LH_"
-local function destroyOld(parent)
-	if not parent then return end
-	for _, child in ipairs(parent:GetChildren()) do
-		if child:IsA("ScreenGui") and (child.Name == "LennonHub" or child.Name:sub(1, #PREFIX) == PREFIX) then
-			pcall(function() child:Destroy() end)
+pcall(function()
+	for _, parent in ipairs({ game:GetService("CoreGui"), localPlayer:FindFirstChild("PlayerGui") }) do
+		if parent then
+			for _, child in ipairs(parent:GetChildren()) do
+				if child:IsA("ScreenGui") and (child.Name == "LennonHub" or child.Name:sub(1, #PREFIX) == PREFIX) then
+					pcall(function() child:Destroy() end)
+				end
+			end
 		end
 	end
-end
-pcall(function() destroyOld(game:GetService("CoreGui")) end)
-pcall(function() destroyOld(localPlayer.PlayerGui) end)
+end)
 
 local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
 local compact = viewport.X < 680 or viewport.Y < 500
 local scale = compact and 0.88 or 0.94
 local iconSize = compact and 40 or 42
 local iconPad = compact and 10 or 14
-local panelPos = compact and UDim2.new(1, -math.floor(262  scale) - 8, 0, 8) or UDim2.new(0.5, 140, 0.5, -math.floor(185  scale / 2) - 22)
 local dropH = CFG.DROPDOWN_ROWS  CFG.ROW_H + (CFG.DROPDOWN_ROWS - 1)  CFG.ROW_GAP + 8
 local dropBlock = dropH + 20
 local rarityCols = 2
@@ -1268,11 +811,9 @@ screenGui.Name = PREFIX .. tostring(math.random(1000000, 9999999))
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = false
 screenGui.DisplayOrder = 100
-screenGui.AutoLocalize = false
 screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
 
 local iconBtn = Instance.new("ImageButton")
-iconBtn.Name = "HubIcon"
 iconBtn.Size = UDim2.fromOffset(iconSize, iconSize)
 iconBtn.Position = UDim2.new(0, iconPad, 0.5, -math.floor(iconSize / 2))
 iconBtn.BackgroundColor3 = Color3.fromRGB(8, 12, 10)
@@ -1289,17 +830,14 @@ iconStroke.Thickness = 1.5
 iconStroke.Transparency = 0.15
 
 local panel = Instance.new("Frame")
-panel.Name = "HubPanel"
 panel.Size = UDim2.fromOffset(262, 185)
-panel.Position = panelPos
+panel.Position = compact and UDim2.new(1, -math.floor(262  scale) - 8, 0, 8) or UDim2.new(0.5, 140, 0.5, -110)
 panel.BackgroundColor3 = Color3.fromRGB(7, 10, 8)
 panel.BackgroundTransparency = 0.12
 panel.Visible = true
 panel.ZIndex = 10
 panel.Parent = screenGui
-local uiScale = Instance.new("UIScale")
-uiScale.Scale = scale
-uiScale.Parent = panel
+Instance.new("UIScale", panel).Scale = scale
 Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
 local panelStroke = Instance.new("UIStroke", panel)
 panelStroke.Color = Color3.fromRGB(35, 145, 70)
@@ -1318,7 +856,6 @@ headerIcon.Size = UDim2.fromOffset(26, 26)
 headerIcon.Position = UDim2.new(0, 0, 0.5, -13)
 headerIcon.BackgroundTransparency = 1
 headerIcon.Image = "rbxassetid://103090301992311"
-headerIcon.ScaleType = Enum.ScaleType.Crop
 headerIcon.ZIndex = 12
 headerIcon.Parent = header
 Instance.new("UICorner", headerIcon).CornerRadius = UDim.new(1, 0)
@@ -1348,14 +885,12 @@ subtitle.ZIndex = 12
 subtitle.Parent = header
 
 local toast = Instance.new("Frame")
-toast.Name = "Toast"
 toast.Size = UDim2.fromOffset(190, 28)
 toast.Position = UDim2.new(0.5, -95, 0, -35)
 toast.BackgroundColor3 = Color3.fromRGB(12, 22, 16)
 toast.BackgroundTransparency = 1
 toast.ZIndex = 50
 toast.Visible = false
-toast.ClipsDescendants = true
 toast.Parent = panel
 Instance.new("UICorner", toast).CornerRadius = UDim.new(0, 8)
 local toastStroke = Instance.new("UIStroke", toast)
@@ -1396,9 +931,7 @@ util.showToast = function(msg)
 		TweenService:Create(toastStroke, TweenInfo.new(0.22), { Transparency = 1 }):Play()
 		t:Play()
 		t.Completed:Connect(function()
-			if toast.Position.Y.Offset <= -25 then
-				toast.Visible = false
-			end
+			if toast.Position.Y.Offset <= -25 then toast.Visible = false end
 		end)
 	end)
 end
@@ -1420,15 +953,9 @@ discordStroke.Thickness = 1.2
 discordStroke.Transparency = 0.3
 discordBtn.MouseButton1Click:Connect(function()
 	pcall(function()
-		if setclipboard then setclipboard("https://discord.gg/xuPkkjQfRR") end
+		if setclipboard then setclipboard("N/A") end
 	end)
 	util.showToast("Discord link copied!")
-	discordStroke.Color = Color3.fromRGB(50, 255, 110)
-	task.delay(0.4, function()
-		if discordStroke and discordStroke.Parent then
-			discordStroke.Color = Color3.fromRGB(88, 101, 242)
-		end
-	end)
 end)
 
 local closeBtn = Instance.new("TextButton")
@@ -1462,10 +989,7 @@ bestCard.BackgroundTransparency = 0.1
 bestCard.ZIndex = 11
 bestCard.Parent = panel
 Instance.new("UICorner", bestCard).CornerRadius = UDim.new(0, 9)
-local bestStroke = Instance.new("UIStroke", bestCard)
-bestStroke.Color = Color3.fromRGB(35, 70, 43)
-bestStroke.Thickness = 1
-bestStroke.Transparency = 0.2
+Instance.new("UIStroke", bestCard).Color = Color3.fromRGB(35, 70, 43)
 
 local bestTag = Instance.new("TextLabel")
 bestTag.Size = UDim2.new(1, -58, 0, 14)
@@ -1501,7 +1025,6 @@ bestRarity.TextColor3 = Color3.fromRGB(170, 190, 178)
 bestRarity.TextSize = 8
 bestRarity.Font = Enum.Font.GothamBold
 bestRarity.TextXAlignment = Enum.TextXAlignment.Left
-bestRarity.TextTruncate = Enum.TextTruncate.AtEnd
 bestRarity.ZIndex = 12
 bestRarity.Parent = bestCard
 
@@ -1519,7 +1042,6 @@ bestValue.ZIndex = 12
 bestValue.Parent = bestCard
 
 local dropToggle = Instance.new("TextButton")
-dropToggle.Name = "DropdownToggle"
 dropToggle.Size = UDim2.fromOffset(18, 18)
 dropToggle.Position = UDim2.new(1, -20, 0, 3)
 dropToggle.BackgroundColor3 = Color3.fromRGB(25, 32, 27)
@@ -1531,15 +1053,13 @@ dropToggle.Parent = bestCard
 Instance.new("UICorner", dropToggle).CornerRadius = UDim.new(1, 0)
 
 local arrow = Instance.new("Frame")
-arrow.Name = "Arrow"
 arrow.AnchorPoint = Vector2.new(0.5, 0.5)
-arrow.Position = UDim2.new(0.5, 0, 0.5, 0)
+arrow.Position = UDim2.fromScale(0.5, 0.5)
 arrow.Size = UDim2.fromOffset(10, 10)
 arrow.BackgroundTransparency = 1
-arrow.Rotation = 0
 arrow.ZIndex = 14
 arrow.Parent = dropToggle
-local a1 = Instance.new("Frame")
+local a1 = Instance.new("Frame", arrow)
 a1.AnchorPoint = Vector2.new(0.5, 0.5)
 a1.Position = UDim2.new(0.5, -3, 0.5, -1)
 a1.Size = UDim2.fromOffset(7, 2)
@@ -1547,9 +1067,7 @@ a1.Rotation = 45
 a1.BackgroundColor3 = Color3.fromRGB(160, 220, 175)
 a1.BorderSizePixel = 0
 a1.ZIndex = 14
-a1.Parent = arrow
-Instance.new("UICorner", a1).CornerRadius = UDim.new(1, 0)
-local a2 = Instance.new("Frame")
+local a2 = Instance.new("Frame", arrow)
 a2.AnchorPoint = Vector2.new(0.5, 0.5)
 a2.Position = UDim2.new(0.5, 3, 0.5, -1)
 a2.Size = UDim2.fromOffset(7, 2)
@@ -1557,8 +1075,6 @@ a2.Rotation = -45
 a2.BackgroundColor3 = Color3.fromRGB(160, 220, 175)
 a2.BorderSizePixel = 0
 a2.ZIndex = 14
-a2.Parent = arrow
-Instance.new("UICorner", a2).CornerRadius = UDim.new(1, 0)
 
 local modeBtn = Instance.new("TextButton")
 modeBtn.Size = UDim2.new(1, -20, 0, 55)
@@ -1588,7 +1104,7 @@ modeTitle.ZIndex = 12
 modeTitle.Parent = modeBtn
 
 local modeDesc = Instance.new("TextLabel")
-modeDesc.Size = UDim2.fromOffset(88, 14)
+modeDesc.Size = UDim2.fromOffset(100, 14)
 modeDesc.Position = UDim2.fromOffset(12, 30)
 modeDesc.BackgroundTransparency = 1
 modeDesc.Text = "Targets highest value"
@@ -1600,16 +1116,13 @@ modeDesc.ZIndex = 12
 modeDesc.Parent = modeBtn
 
 util.loopButton = Instance.new("TextButton")
-util.loopButton.Name = "LoopCheckbox"
-util.loopButton.AnchorPoint = Vector2.new(0.5, 0.5)
 util.loopButton.Size = UDim2.fromOffset(52, 20)
-util.loopButton.Position = UDim2.new(0.525, 0, 0.5, 0)
+util.loopButton.Position = UDim2.new(0.525, -26, 0.5, -10)
 util.loopButton.BackgroundTransparency = 1
 util.loopButton.Text = ""
 util.loopButton.AutoButtonColor = false
 util.loopButton.ZIndex = 13
 util.loopButton.Parent = modeBtn
-
 util.loopBox = Instance.new("Frame")
 util.loopBox.Size = UDim2.fromOffset(14, 14)
 util.loopBox.Position = UDim2.fromOffset(0, 3)
@@ -1621,7 +1134,6 @@ Instance.new("UICorner", util.loopBox).CornerRadius = UDim.new(0, 4)
 util.loopBoxStroke = Instance.new("UIStroke", util.loopBox)
 util.loopBoxStroke.Color = Color3.fromRGB(90, 120, 98)
 util.loopBoxStroke.Thickness = 1
-util.loopBoxStroke.Transparency = 0.15
 util.loopCheck = Instance.new("TextLabel")
 util.loopCheck.Size = UDim2.fromScale(1, 1)
 util.loopCheck.BackgroundTransparency = 1
@@ -1637,12 +1149,10 @@ util.loopLabel.Size = UDim2.new(1, -18, 1, 0)
 util.loopLabel.Position = UDim2.fromOffset(18, 0)
 util.loopLabel.BackgroundTransparency = 1
 util.loopLabel.Text = "LOOP"
-util.loopLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+util.loopLabel.TextColor3 = Color3.fromRGB(145, 165, 150)
 util.loopLabel.TextSize = 11
 util.loopLabel.Font = Enum.Font.GothamBold
 util.loopLabel.TextXAlignment = Enum.TextXAlignment.Left
-util.loopLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-util.loopLabel.TextStrokeTransparency = 0
 util.loopLabel.ZIndex = 14
 util.loopLabel.Parent = util.loopButton
 
@@ -1662,7 +1172,6 @@ toggleKnob.Parent = toggleTrack
 Instance.new("UICorner", toggleKnob).CornerRadius = UDim.new(1, 0)
 
 local dropList = Instance.new("Frame")
-dropList.Name = "DropdownList"
 dropList.Size = UDim2.new(1, -20, 0, dropBlock + rarityBlock)
 dropList.Position = UDim2.fromOffset(10, 120)
 dropList.BackgroundTransparency = 1
@@ -1671,9 +1180,8 @@ dropList.ZIndex = 11
 dropList.Parent = panel
 
 local rows = {}
-util.createDropdownRow = function(i)
+for i = 1, CFG.DROPDOWN_ROWS do
 	local row = Instance.new("TextButton")
-	row.Name = "Row" .. i
 	row.Size = UDim2.new(1, 0, 0, CFG.ROW_H)
 	row.Position = UDim2.fromOffset(0, (i - 1)  (CFG.ROW_H + CFG.ROW_GAP))
 	row.BackgroundColor3 = Color3.fromRGB(13, 19, 15)
@@ -1684,11 +1192,7 @@ util.createDropdownRow = function(i)
 	row.Visible = false
 	row.Parent = dropList
 	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
-	local stroke = Instance.new("UIStroke", row)
-	stroke.Color = Color3.fromRGB(35, 70, 43)
-	stroke.Thickness = 1
-	stroke.Transparency = 0.35
-	local rank = Instance.new("TextLabel")
+	local rank = Instance.new("TextLabel", row)
 	rank.Size = UDim2.fromOffset(16, CFG.ROW_H)
 	rank.Position = UDim2.fromOffset(6, 0)
 	rank.BackgroundTransparency = 1
@@ -1697,8 +1201,7 @@ util.createDropdownRow = function(i)
 	rank.TextSize = 9
 	rank.Font = Enum.Font.GothamBold
 	rank.ZIndex = 13
-	rank.Parent = row
-	local preview = Instance.new("Frame")
+	local preview = Instance.new("Frame", row)
 	preview.Name = "Preview"
 	preview.AnchorPoint = Vector2.new(0, 0.5)
 	preview.Position = UDim2.new(0, 26, 0.5, 0)
@@ -1708,9 +1211,8 @@ util.createDropdownRow = function(i)
 	preview.BorderSizePixel = 0
 	preview.ClipsDescendants = true
 	preview.ZIndex = 13
-	preview.Parent = row
 	Instance.new("UICorner", preview).CornerRadius = UDim.new(0, 6)
-	local nameL = Instance.new("TextLabel")
+	local nameL = Instance.new("TextLabel", row)
 	nameL.Size = UDim2.new(1, -130, 0, 14)
 	nameL.Position = UDim2.fromOffset(58, 4)
 	nameL.BackgroundTransparency = 1
@@ -1721,8 +1223,7 @@ util.createDropdownRow = function(i)
 	nameL.TextXAlignment = Enum.TextXAlignment.Left
 	nameL.TextTruncate = Enum.TextTruncate.AtEnd
 	nameL.ZIndex = 13
-	nameL.Parent = row
-	local rarityL = Instance.new("TextLabel")
+	local rarityL = Instance.new("TextLabel", row)
 	rarityL.Size = UDim2.new(1, -130, 0, 11)
 	rarityL.Position = UDim2.fromOffset(58, 17)
 	rarityL.BackgroundTransparency = 1
@@ -1731,10 +1232,8 @@ util.createDropdownRow = function(i)
 	rarityL.TextSize = 7
 	rarityL.Font = Enum.Font.GothamBold
 	rarityL.TextXAlignment = Enum.TextXAlignment.Left
-	rarityL.TextTruncate = Enum.TextTruncate.AtEnd
 	rarityL.ZIndex = 13
-	rarityL.Parent = row
-	local valueL = Instance.new("TextLabel")
+	local valueL = Instance.new("TextLabel", row)
 	valueL.AnchorPoint = Vector2.new(1, 0)
 	valueL.Size = UDim2.fromOffset(60, 20)
 	valueL.Position = UDim2.new(1, -8, 0, 5)
@@ -1745,25 +1244,10 @@ util.createDropdownRow = function(i)
 	valueL.Font = Enum.Font.GothamBold
 	valueL.TextXAlignment = Enum.TextXAlignment.Right
 	valueL.ZIndex = 13
-	valueL.Parent = row
-	return {
-		Row = row,
-		Preview = preview,
-		NameLabel = nameL,
-		RarityLabel = rarityL,
-		ValueLabel = valueL,
-		Egg = nil,
-		LastUid = nil,
-		LastCategory = nil,
-	}
+	rows[i] = { Row = row, Preview = preview, NameLabel = nameL, RarityLabel = rarityL, ValueLabel = valueL, Egg = nil, LastUid = nil, LastCategory = nil }
 end
 
-for i = 1, CFG.DROPDOWN_ROWS do
-	rows[i] = util.createDropdownRow(i)
-end
-
-local rarityTitle = Instance.new("TextLabel")
-rarityTitle.Name = "RarityFilterTitle"
+local rarityTitle = Instance.new("TextLabel", dropList)
 rarityTitle.Size = UDim2.new(1, 0, 0, 18)
 rarityTitle.Position = UDim2.fromOffset(0, dropH)
 rarityTitle.BackgroundTransparency = 1
@@ -1773,113 +1257,80 @@ rarityTitle.TextSize = 8
 rarityTitle.Font = Enum.Font.GothamBold
 rarityTitle.TextXAlignment = Enum.TextXAlignment.Left
 rarityTitle.ZIndex = 12
-rarityTitle.Parent = dropList
 
-local rarityList = Instance.new("Frame")
-rarityList.Name = "RarityFilterList"
+local rarityList = Instance.new("Frame", dropList)
 rarityList.Size = UDim2.new(1, 0, 0, rarityBlock)
 rarityList.Position = UDim2.fromOffset(0, dropBlock)
 rarityList.BackgroundTransparency = 1
-rarityList.Visible = true
 rarityList.ZIndex = 11
-rarityList.Parent = dropList
 
 local rarityChecks = {}
-util.createRarityCheckbox = function(i, opt)
+for i, opt in ipairs(rarityOptions) do
 	local col = (i - 1) % rarityCols
-	local row = math.floor((i - 1) / rarityCols)
-	local btn = Instance.new("TextButton")
-	btn.Name = "RarityCheckbox" .. opt.Key
+	local r = math.floor((i - 1) / rarityCols)
+	local btn = Instance.new("TextButton", rarityList)
 	btn.Size = UDim2.new(0.5, -3, 0, rarityH)
-	btn.Position = UDim2.new(col  0.5, col == 0 and 0 or 3, 0, row  (rarityH + rarityGap))
+	btn.Position = UDim2.new(col  0.5, col == 0 and 0 or 3, 0, r  (rarityH + rarityGap))
 	btn.BackgroundColor3 = Color3.fromRGB(13, 19, 15)
 	btn.BackgroundTransparency = 0.08
-	btn.BorderSizePixel = 0
 	btn.AutoButtonColor = false
 	btn.Text = ""
 	btn.ZIndex = 12
-	btn.Parent = rarityList
 	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
 	local stroke = Instance.new("UIStroke", btn)
 	stroke.Color = opt.Color
 	stroke.Thickness = 1
 	stroke.Transparency = 0.35
-	local box = Instance.new("TextLabel")
-	box.Name = "Check"
+	local box = Instance.new("TextLabel", btn)
 	box.Size = UDim2.fromOffset(16, 16)
 	box.Position = UDim2.fromOffset(5, 4)
 	box.BackgroundColor3 = opt.Color
 	box.BackgroundTransparency = 0.55
-	box.BorderSizePixel = 0
 	box.Text = ""
 	box.TextColor3 = Color3.fromRGB(7, 10, 8)
 	box.TextSize = 12
 	box.Font = Enum.Font.GothamBlack
 	box.ZIndex = 13
-	box.Parent = btn
 	Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
-	local label = Instance.new("TextLabel")
-	label.Name = "Label"
+	local label = Instance.new("TextLabel", btn)
 	label.Size = UDim2.new(1, -28, 1, 0)
 	label.Position = UDim2.fromOffset(26, 0)
 	label.BackgroundTransparency = 1
 	label.Text = opt.Label
 	label.TextColor3 = opt.Key == "secret" and Color3.fromRGB(255, 255, 255) or opt.Color
-	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-	label.TextStrokeTransparency = opt.Key == "secret" and 0 or 1
 	label.TextSize = 8
 	label.Font = Enum.Font.GothamBold
 	label.TextXAlignment = Enum.TextXAlignment.Left
 	label.ZIndex = 13
-	label.Parent = btn
-	return { Row = btn, Box = box, Stroke = stroke, Label = label, Option = opt }
-end
-
-for i, opt in ipairs(rarityOptions) do
-	rarityChecks[opt.Key] = util.createRarityCheckbox(i, opt)
+	rarityChecks[opt.Key] = { Row = btn, Box = box, Stroke = stroke, Label = label, Option = opt }
 end
 
 util.updateRarityChecks = function()
 	for _, opt in ipairs(rarityOptions) do
 		local ui = rarityChecks[opt.Key]
 		local on = state.rarityFilter[opt.Key] == true
-		local isSecret = opt.Key == "secret"
-		ui.Label.TextColor3 = isSecret and Color3.fromRGB(255, 255, 255) or opt.Color
-		ui.Label.TextStrokeTransparency = isSecret and 0 or 1
 		ui.Box.Text = on and "v" or ""
-		ui.Box.BackgroundColor3 = opt.Color
 		ui.Box.BackgroundTransparency = on and 0 or 0.55
-		ui.Box.TextColor3 = on and Color3.fromRGB(10, 12, 10) or opt.Color
-		ui.Stroke.Color = opt.Color
 		ui.Stroke.Transparency = on and 0 or 0.35
 		ui.Row.BackgroundColor3 = on and Color3.fromRGB(24, 48, 31) or Color3.fromRGB(13, 19, 15)
 	end
 end
 
 util.attachViewport = function(parent, category)
-	if not AssetViewport then return end
-	local ok, vp = pcall(function()
-		return AssetViewport.Mount(parent)
-	end)
+	if not AssetViewport or not category then return end
+	local ok, vp = pcall(function() return AssetViewport.Mount(parent) end)
 	if not ok or not vp then return end
 	vp.Size = UDim2.fromScale(1, 1)
 	vp.Position = UDim2.fromScale(0.5, 0.5)
 	vp.AnchorPoint = Vector2.new(0.5, 0.5)
 	vp.BackgroundTransparency = 1
 	vp.ZIndex = 14
-	if not pcall(function()
-		return AssetViewport.ShowAsset(category, vp, true)
-	end) then
-		if vp then vp:Destroy() end
-	end
+	pcall(function() AssetViewport.ShowAsset(category, vp, true) end)
 end
 
 local lastPreview = nil
 util.updatePetPreview = function(category)
-	if not panel.Visible then
-		lastPreview = nil
-		return
-	end
+	if not panel.Visible then lastPreview = nil return end
 	if lastPreview == category and bestCard:FindFirstChild("Preview") then return end
 	lastPreview = category
 	local old = bestCard:FindFirstChild("Preview")
@@ -1900,84 +1351,6 @@ util.updatePetPreview = function(category)
 	util.attachViewport(frame, category)
 end
 
-util.formatNumber = function(n)
-	n = tonumber(n) or 0
-	local function trim(x)
-		return (string.format("%.2f", x):gsub("(%..-)0+\( ", "%1"):gsub("%. \)", ""))
-	end
-	local abs = math.abs(n)
-	for _, pair in ipairs({ { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }) do
-		if abs >= pair[1] then
-			return trim(n / pair[1]) .. pair[2]
-		end
-	end
-	return tostring(math.floor(n + 0.5))
-end
-
-util.getScaleMultiplier = function(scaleVal)
-	local n = tonumber(scaleVal) or 1
-	if n <= 5 then return n ^ 1.85 end
-	return (n / 5) ^ 1.2  19.637875755794113
-end
-
-util.getEggData = function(record)
-	local dir = Assets.Directory[record.AssetCategory]
-	if not dir then return nil end
-	local rate = tonumber(dir.EarningRate) or 0
-	local scaleVal = tonumber(record.AssetScale) or 1
-	local mutMul = 1
-	if record.Mutations and #record.Mutations > 0 and type(Mutations.EarningsFor) == "function" then
-		local ok, result = pcall(function()
-			return Mutations.EarningsFor(record.Mutations)
-		end)
-		if ok then mutMul = tonumber(result) or 1 end
-	end
-	local gen = rate  util.getScaleMultiplier(scaleVal)  mutMul
-	local color = Color3.fromRGB(170, 190, 178)
-	local rarityNum = 0
-	local rarityName = ""
-	if dir.Rarity then
-		rarityNum = dir.Rarity.RarityNumber or 0
-		rarityName = dir.Rarity.DisplayName or dir.Rarity.Name or ""
-		color = util.getOfficialRarityColor(rarityName)
-	end
-	return {
-		Uid = record.Uid,
-		Category = record.AssetCategory,
-		Name = dir.DisplayName or record.AssetCategory,
-		Generation = math.round(gen),
-		Position = record.BottomCFrame.Position,
-		BottomCFrame = record.BottomCFrame,
-		Rarity = rarityNum,
-		RarityName = rarityName,
-		RarityColor = color,
-		BaseRate = rate,
-		Scale = scaleVal,
-	}
-end
-
-util.getGroundPosition = function()
-	local objects = workspace:FindFirstChild("OBJECTS")
-	if not objects then return nil end
-	local areas = objects:FindFirstChild("Areas")
-	if not areas then return nil end
-	local ground = areas:FindFirstChild("Ground")
-	if not ground then return nil end
-	if ground:IsA("BasePart") then
-		return ground.Position + Vector3.new(0, ground.Size.Y  0.5 + CFG.GROUND_OFFSET, 0)
-	end
-	if ground:IsA("Model") then
-		local pivot = ground:GetPivot()
-		local _, size = ground:GetBoundingBox()
-		return pivot.Position + Vector3.new(0, size.Y  0.5 + CFG.GROUND_OFFSET, 0)
-	end
-	local part = ground:FindFirstChildWhichIsA("BasePart", true)
-	if part then
-		return part.Position + Vector3.new(0, part.Size.Y  0.5 + CFG.GROUND_OFFSET, 0)
-	end
-	return nil
-end
-
 util.refreshDropdownRows = function()
 	for i = 1, CFG.DROPDOWN_ROWS do
 		local ui = rows[i]
@@ -1986,9 +1359,7 @@ util.refreshDropdownRows = function()
 		local uid = egg and tostring(egg.Uid) or nil
 		local cat = egg and egg.Category or nil
 		if ui.LastUid ~= uid or ui.LastCategory ~= cat then
-			for _, child in ipairs(ui.Preview:GetChildren()) do
-				child:Destroy()
-			end
+			for _, c in ipairs(ui.Preview:GetChildren()) do c:Destroy() end
 			ui.LastUid = uid
 			ui.LastCategory = cat
 			if egg then util.attachViewport(ui.Preview, cat) end
@@ -2038,10 +1409,9 @@ end)
 for i = 1, CFG.DROPDOWN_ROWS do
 	local ui = rows[i]
 	ui.Row.MouseButton1Click:Connect(function()
-		local egg = ui.Egg
-		if egg then
-			state.selectedEgg = egg
-			state.selectedUid = egg.Uid
+		if ui.Egg then
+			state.selectedEgg = ui.Egg
+			state.selectedUid = ui.Egg.Uid
 			state.targetEgg = nil
 			if state.enabled and not state.carrying and not state.carryLocked and not state.isProtecting and not state.isDelivering then
 				util.finishMove()
@@ -2050,26 +1420,19 @@ for i = 1, CFG.DROPDOWN_ROWS do
 		end
 		util.closeDropdown()
 	end)
-	ui.Row.MouseEnter:Connect(function()
-		TweenService:Create(ui.Row, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(19, 28, 21) }):Play()
-	end)
-	ui.Row.MouseLeave:Connect(function()
-		TweenService:Create(ui.Row, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(13, 19, 15) }):Play()
-	end)
 end
 
 util.refreshEggs = function(force)
 	local now = tick()
-	if not force and now - state.lastRefresh < CFG.REFRESH_INTERVAL then
-		return state.eggs
-	end
+	if not force and now - state.lastRefresh < CFG.REFRESH_INTERVAL then return state.eggs end
+	if not remotes.AskFieldEggSnapshot then return state.eggs end
 	local ok, result = pcall(function()
 		return remotes.AskFieldEggSnapshot:InvokeServer()
 	end)
-	if not ok then return state.eggs end
+	if not ok or not result then return state.eggs end
 	local eggs = state.eggs
 	table.clear(eggs)
-	if result and result.Records then
+	if result.Records then
 		for _, record in ipairs(result.Records) do
 			if record.State == "Slot" or record.State == "Dropped" then
 				local data = util.getEggData(record)
@@ -2077,9 +1440,7 @@ util.refreshEggs = function(force)
 			end
 		end
 	end
-	table.sort(eggs, function(a, b)
-		return a.Generation > b.Generation
-	end)
+	table.sort(eggs, function(a, b) return a.Generation > b.Generation end)
 	local filtered = state.filteredEggs
 	table.clear(filtered)
 	for _, egg in ipairs(eggs) do
@@ -2087,9 +1448,9 @@ util.refreshEggs = function(force)
 			filtered[#filtered + 1] = egg
 		end
 	end
-	state.bestEgg = state.filteredEggs[1]
+	state.bestEgg = filtered[1]
 	state.lastRefresh = now
-	return state.eggs
+	return eggs
 end
 
 util.getActiveTargetEgg = function()
@@ -2117,26 +1478,10 @@ for _, opt in ipairs(rarityOptions) do
 		state.lastRefresh = 0
 		util.updateRarityChecks()
 		util.refreshEggs(true)
-		if state.enabled and state.mode == "GUIDED" and not state.carrying and not state.carryLocked and not state.isProtecting and not state.isDelivering then
-			util.finishMove()
-			state.isStealing = false
-		end
-	end)
-	ui.Row.MouseEnter:Connect(function()
-		if not state.rarityFilter[opt.Key] then
-			TweenService:Create(ui.Row, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(19, 28, 21) }):Play()
-		end
-	end)
-	ui.Row.MouseLeave:Connect(function()
-		if not state.rarityFilter[opt.Key] then
-			TweenService:Create(ui.Row, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(13, 19, 15) }):Play()
-		end
 	end)
 end
-
 util.updateRarityChecks()
 
-local beam, att0, att1 = nil, nil, nil
 util.clearBeam = function()
 	if beam then beam:Destroy() beam = nil end
 	if att0 then att0:Destroy() att0 = nil end
@@ -2150,10 +1495,8 @@ util.createBeam = function(pos)
 	if not humanoidRootPart or not humanoidRootPart.Parent or not pos then return end
 	util.clearBeam()
 	att0 = Instance.new("Attachment")
-	att0.Name = "BeamOrigin"
 	att0.Parent = humanoidRootPart
 	local part = Instance.new("Part")
-	part.Name = "BeamTarget"
 	part.Size = Vector3.new(0.1, 0.1, 0.1)
 	part.Transparency = 1
 	part.Anchored = true
@@ -2165,14 +1508,12 @@ util.createBeam = function(pos)
 	att1 = Instance.new("Attachment")
 	att1.Parent = part
 	beam = Instance.new("Beam")
-	beam.Name = "TargetBeam"
 	beam.Attachment0 = att0
 	beam.Attachment1 = att1
 	beam.Width0 = CFG.BEAM_WIDTH
 	beam.Width1 = CFG.BEAM_WIDTH
 	beam.FaceCamera = true
 	beam.LightEmission = 1
-	beam.LightInfluence = 0
 	beam.Color = ColorSequence.new(Color3.fromRGB(50, 255, 110))
 	beam.Parent = humanoidRootPart
 end
@@ -2182,17 +1523,15 @@ util.updateBestDisplay = function()
 	local egg = util.getActiveTargetEgg()
 	pcall(function()
 		if not egg then
-			if bestName and bestName.Parent then bestName.Text = "NO EGG FOUND" end
-			if bestRarity and bestRarity.Parent then bestRarity.Text = "" end
-			if bestValue and bestValue.Parent then bestValue.Text = "--" end
+			bestName.Text = "NO EGG FOUND"
+			bestRarity.Text = ""
+			bestValue.Text = "--"
 			util.updatePetPreview(nil)
 		else
-			if bestName and bestName.Parent then bestName.Text = tostring(egg.Name or "UNKNOWN") end
-			if bestRarity and bestRarity.Parent then
-				bestRarity.Text = tostring(egg.RarityName or "")
-				bestRarity.TextColor3 = egg.RarityColor or Color3.fromRGB(170, 190, 178)
-			end
-			if bestValue and bestValue.Parent then bestValue.Text = util.formatNumber(egg.Generation or 0) end
+			bestName.Text = tostring(egg.Name or "UNKNOWN")
+			bestRarity.Text = tostring(egg.RarityName or "")
+			bestRarity.TextColor3 = egg.RarityColor or Color3.fromRGB(170, 190, 178)
+			bestValue.Text = util.formatNumber(egg.Generation or 0)
 			util.updatePetPreview(egg.Category)
 		end
 	end)
@@ -2201,7 +1540,6 @@ util.updateBestDisplay = function()
 end
 
 util.updateLoopUI = function()
-	if not util.loopBox or not util.loopBox.Parent then return end
 	if state.loopEnabled then
 		util.loopBox.BackgroundColor3 = Color3.fromRGB(50, 255, 110)
 		util.loopBoxStroke.Color = Color3.fromRGB(90, 255, 140)
@@ -2217,10 +1555,8 @@ end
 
 util.updateToggle = function()
 	if state.enabled then
-		TweenService:Create(toggleTrack, TweenInfo.new(0.18, Enum.EasingStyle.Quart), {
-			BackgroundColor3 = Color3.fromRGB(30, 205, 90),
-		}):Play()
-		TweenService:Create(toggleKnob, TweenInfo.new(0.18, Enum.EasingStyle.Quart), {
+		TweenService:Create(toggleTrack, TweenInfo.new(0.18), { BackgroundColor3 = Color3.fromRGB(30, 205, 90) }):Play()
+		TweenService:Create(toggleKnob, TweenInfo.new(0.18), {
 			Position = UDim2.new(1, -17, 0.5, -7),
 			BackgroundColor3 = Color3.fromRGB(240, 255, 242),
 		}):Play()
@@ -2233,10 +1569,8 @@ util.updateToggle = function()
 			modeDesc.Text = "ONE SHOT IN PROGRESS"
 		end
 	else
-		TweenService:Create(toggleTrack, TweenInfo.new(0.18, Enum.EasingStyle.Quart), {
-			BackgroundColor3 = Color3.fromRGB(32, 42, 35),
-		}):Play()
-		TweenService:Create(toggleKnob, TweenInfo.new(0.18, Enum.EasingStyle.Quart), {
+		TweenService:Create(toggleTrack, TweenInfo.new(0.18), { BackgroundColor3 = Color3.fromRGB(32, 42, 35) }):Play()
+		TweenService:Create(toggleKnob, TweenInfo.new(0.18), {
 			Position = UDim2.new(0, 3, 0.5, -7),
 			BackgroundColor3 = Color3.fromRGB(145, 155, 148),
 		}):Play()
@@ -2246,20 +1580,16 @@ util.updateToggle = function()
 end
 
 util.startEggProtection = function(uid)
-	if not uid then return end
+	if not uid or not remotes.AskFieldEggCarry then return end
 	if state.isProtecting and state.heldEggUid == uid then return end
 	state.isProtecting = true
 	state.heldEggUid = uid
-	state.lastProtectTime = 0
 	task.spawn(function()
 		while state.isProtecting and state.heldEggUid == uid do
-			state.lastProtectTime = tick()
 			local ok, result = pcall(function()
 				return remotes.AskFieldEggCarry:InvokeServer({ Uid = uid })
 			end)
-			if ok and result == true then
-				state.carrying = true
-			end
+			if ok and result == true then state.carrying = true end
 			task.wait(CFG.PROTECT_INTERVAL)
 		end
 	end)
@@ -2279,7 +1609,6 @@ util.completeGuidedCycle = function()
 	if not state.guidedCycleActive then return end
 	state.guidedCycleActive = false
 	state.lastRefresh = 0
-	if state.mode ~= "GUIDED" then return end
 	if state.enabled and state.runLoop then
 		util.updateToggle()
 		return
@@ -2298,12 +1627,6 @@ util.startDelivery = function()
 	state.isDelivering = true
 	util.clearBeam()
 	util.createBeam(groundPos)
-	if humanoidRootPart and humanoidRootPart.Parent then
-		local look = Vector3.new(deliverPos.X - humanoidRootPart.Position.X, 0, deliverPos.Z - humanoidRootPart.Position.Z)
-		if look.Magnitude > 0.01 then
-			humanoidRootPart.CFrame = CFrame.lookAt(humanoidRootPart.Position, humanoidRootPart.Position + look.Unit)
-		end
-	end
 	util.startMove(deliverPos, function()
 		state.isDelivering = false
 		util.cleanupBossMount()
@@ -2313,7 +1636,7 @@ util.startDelivery = function()
 end
 
 util.startSpammingCarry = function(uid)
-	if not uid or state.isStealing then return end
+	if not uid or state.isStealing or not remotes.AskFieldEggCarry then return end
 	if state.carrying and state.heldEggUid == uid then return end
 	state.isStealing = true
 	state.lastSpamTime = 0
@@ -2333,24 +1656,8 @@ util.startSpammingCarry = function(uid)
 					state.heldEggUid = uid
 					state.carryLocked = true
 					util.spawnBossForEgg(state.targetEgg or util.getActiveTargetEgg())
-					task.spawn(function()
-						util.startEggProtection(uid)
-					end)
-					task.spawn(function()
-						local groundPos = util.getGroundPosition()
-						local deliverPos = util.getBossDeliveryPosition(groundPos)
-						if groundPos and deliverPos then
-							state.isDelivering = true
-							util.clearBeam()
-							util.createBeam(groundPos)
-							util.startMove(deliverPos, function()
-								state.isDelivering = false
-								util.cleanupBossMount()
-								util.resetCarryState()
-								util.completeGuidedCycle()
-							end, true)
-						end
-					end)
+					task.spawn(function() util.startEggProtection(uid) end)
+					task.spawn(function() util.startDelivery() end)
 					break
 				else
 					RunService.Heartbeat:Wait()
@@ -2368,10 +1675,7 @@ util.moveToBestEggTP = function()
 	util.refreshEggs(true)
 	local egg = util.getActiveTargetEgg()
 	if not egg or not humanoidRootPart or not humanoidRootPart.Parent then return false end
-	if state.mode == "GUIDED" then
-		state.guidedCycleActive = true
-		if state.enabled then util.updateToggle() end
-	end
+	state.guidedCycleActive = true
 	state.targetEgg = egg
 	local pos = egg.Position
 	util.createBeam(pos)
@@ -2379,8 +1683,10 @@ util.moveToBestEggTP = function()
 		util.startSpammingCarry(egg.Uid)
 		return true
 	end
-	util.startMove(pos - (pos - humanoidRootPart.Position).Unit  CFG.SPAWN_OFFSET, function()
-		if state.enabled and not state.carrying and not state.carryLocked and not state.isProtecting and not state.isDelivering and state.targetEgg and state.targetEgg.Uid == egg.Uid then
+	local dir = pos - humanoidRootPart.Position
+	if dir.Magnitude < 0.01 then dir = Vector3.new(0, 0, -1) end
+	util.startMove(pos - dir.Unit  CFG.SPAWN_OFFSET, function()
+		if state.enabled and not state.carrying and not state.carryLocked and state.targetEgg and state.targetEgg.Uid == egg.Uid then
 			util.startSpammingCarry(egg.Uid)
 		end
 	end)
@@ -2390,7 +1696,6 @@ end
 util.cancelEverything = function()
 	util.cleanupBossMount()
 	util.stopCurrentTween(true)
-	util.restoreOriginalHumanoid()
 	state.isMoving = false
 	state.moveTarget = nil
 	state.onArrive = nil
@@ -2406,119 +1711,60 @@ util.cancelEverything = function()
 end
 
 util.setupCharacter = function(char)
-	if util.motorAddedConn then util.motorAddedConn:Disconnect() util.motorAddedConn = nil end
-	if util.motorRemovingConn then util.motorRemovingConn:Disconnect() util.motorRemovingConn = nil end
 	characterRef = char
-	humanoidRootPart = char:WaitForChild("HumanoidRootPart")
+	humanoidRootPart = char:WaitForChild("HumanoidRootPart", 5)
 	humanoid = char:FindFirstChildOfClass("Humanoid")
-	util.motorCache = {}
-	util.walk(char, function(obj)
-		if obj:IsA("Motor6D") then
-			util.motorCache[#util.motorCache + 1] = obj
+end
+
+if remotes.FieldEggCarry then
+	remotes.FieldEggCarry.OnClientEvent:Connect(function(data)
+		if not data or not data.Uid then return end
+		local uid = data.Uid
+		if data.CarrierUserId == localPlayer.UserId then
+			if uid == state.heldEggUid then
+				state.carrying = true
+				return
+			end
+			if state.targetEgg and uid == state.targetEgg.Uid then
+				state.carrying = true
+				state.heldEggUid = uid
+				state.carryLocked = true
+				state.isStealing = false
+				util.spawnBossForEgg(state.targetEgg or util.getActiveTargetEgg())
+				task.spawn(function() util.startEggProtection(uid) end)
+				task.spawn(function() util.startDelivery() end)
+			end
+			return
 		end
-	end)
-	util.motorAddedConn = char.DescendantAdded:Connect(function(d)
-		if d:IsA("Motor6D") then table.insert(util.motorCache, d) end
-	end)
-	util.motorRemovingConn = char.DescendantRemoving:Connect(function(d)
-		if not d:IsA("Motor6D") then return end
-		for i = #util.motorCache, 1, -1 do
-			if util.motorCache[i] == d then
-				table.remove(util.motorCache, i)
-				break
+		if uid == state.heldEggUid then
+			state.carrying = false
+			state.carryLocked = false
+			if not state.isProtecting then
+				task.spawn(function() util.startEggProtection(uid) end)
 			end
 		end
 	end)
 end
 
-remotes.FieldEggCarry.OnClientEvent:Connect(function(data)
-	if not data or not data.Uid then return end
-	local uid = data.Uid
-	if data.CarrierUserId == localPlayer.UserId then
-		if uid == state.heldEggUid then
-			state.carrying = true
-			return
-		end
-		if state.targetEgg and uid == state.targetEgg.Uid then
-			state.carrying = true
-			state.heldEggUid = uid
-			state.carryLocked = true
-			state.isStealing = false
-			util.spawnBossForEgg(state.targetEgg or util.getActiveTargetEgg())
-			task.spawn(function() util.startEggProtection(uid) end)
-			task.spawn(function() util.startDelivery() end)
-		end
-		return
-	end
-	if uid == state.heldEggUid then
-		state.carrying = false
-		state.carryLocked = false
-		if not state.isProtecting then
-			task.spawn(function() util.startEggProtection(uid) end)
-		end
-		return
-	end
-	if state.targetEgg and uid == state.targetEgg.Uid then
-		state.carrying = false
-		if not state.isStealing then
-			task.defer(function()
-				task.wait(0.02)
-				if state.targetEgg and state.targetEgg.Uid == uid and not state.carrying then
-					util.startSpammingCarry(uid)
-				end
-			end)
-		end
-	end
-end)
-
-util.newTGRuntime = util.newTGRuntime or {
-	running = false,
-	cleanup = nil,
-	cooldownUntil = 0,
-}
-
-util.stopNewTeleguiado = function()
-	local rt = util.newTGRuntime
-	local cleanup = rt.cleanup
-	rt.cleanup = nil
-	if cleanup then pcall(cleanup) end
-	rt.running = false
-end
-
-local startGuided
-
-util.startNewTeleguiado = function()
-	local rt = util.newTGRuntime
-	if rt.running then return false end
-	if tick() < (rt.cooldownUntil or 0) then return false end
+local function startGuided()
 	if not state.enabled then return false end
 	if not util.canLeaveForSteal() then
 		state.waitingForDay = true
 		util.updateToggle()
 		return false
 	end
-	state.mode = "GUIDED"
 	state.waitingForDay = false
-	state.targetEgg = nil
-	state.isMoving = false
-	state.isStealing = false
-	state.isProtecting = false
-	state.isDelivering = false
-	state.carrying = false
-	state.carryLocked = false
-	state.heldEggUid = nil
-	rt.running = true
-	rt.cleanup = nil
 	util.updateToggle()
-	util.moveToBestEggTP()
-	return true
+	util.refreshEggs(true)
+	util.updateBestDisplay()
+	return util.moveToBestEggTP()
 end
 
 task.spawn(function()
 	while state.running do
 		task.wait(CFG.REFRESH_INTERVAL)
 		if state.enabled or panel.Visible then
-			util.updateBestDisplay()
+			pcall(util.updateBestDisplay)
 		end
 		if state.enabled then
 			if not util.canLeaveForSteal() then
@@ -2531,7 +1777,7 @@ task.spawn(function()
 					state.waitingForDay = false
 					util.updateToggle()
 				end
-				if not util.newTGRuntime.running then
+				if not state.isMoving and not state.isStealing and not state.carrying and not state.isDelivering and not state.isProtecting then
 					startGuided()
 				end
 			end
@@ -2539,43 +1785,10 @@ task.spawn(function()
 	end
 end)
 
-util.updateModeUI = function()
-	state.mode = "GUIDED"
-	modeTitle.Text = "GUIDED"
-	if state.enabled and state.waitingForDay then
-		modeDesc.Text = util.isDaytime() and "WAITING FOR GATE" or "WAITING FOR DAY"
-	elseif state.enabled then
-		modeDesc.Text = state.runLoop and "LOOP ACTIVE" or "ONE SHOT IN PROGRESS"
-	else
-		modeDesc.Text = state.loopEnabled and "LOOP READY" or "ONE SHOT"
-	end
-end
-
-startGuided = function()
-	if not state.enabled then return false end
-	state.mode = "GUIDED"
-	if not util.canLeaveForSteal() then
-		state.waitingForDay = true
-		util.updateToggle()
-		return false
-	end
-	state.waitingForDay = false
-	util.updateToggle()
-	util.refreshEggs(true)
-	util.updateBestDisplay()
-	return util.startNewTeleguiado()
-end
-
 util.loopButton.MouseButton1Click:Connect(function()
 	state.loopEnabled = not state.loopEnabled
 	util.updateLoopUI()
 	if not state.enabled then util.updateToggle() end
-end)
-util.loopButton.MouseEnter:Connect(function()
-	util.loopLabel.TextColor3 = Color3.fromRGB(210, 255, 220)
-end)
-util.loopButton.MouseLeave:Connect(function()
-	util.updateLoopUI()
 end)
 
 modeBtn.MouseButton1Click:Connect(function()
@@ -2584,14 +1797,11 @@ modeBtn.MouseButton1Click:Connect(function()
 		state.waitingForDay = false
 		state.runLoop = false
 		state.guidedCycleActive = false
-		util.stopNewTeleguiado()
 		util.cancelEverything()
 		util.updateToggle()
 		return
 	end
-	util.stopNewTeleguiado()
 	util.cancelEverything()
-	state.mode = "GUIDED"
 	state.runLoop = state.loopEnabled
 	state.enabled = true
 	state.waitingForDay = not util.canLeaveForSteal()
@@ -2604,12 +1814,6 @@ modeBtn.MouseButton1Click:Connect(function()
 	end
 	startGuided()
 end)
-modeBtn.MouseEnter:Connect(function()
-	TweenService:Create(modeBtn, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(19, 28, 21) }):Play()
-end)
-modeBtn.MouseLeave:Connect(function()
-	TweenService:Create(modeBtn, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(13, 19, 15) }):Play()
-end)
 
 local panelOpen = true
 util.openPanel = function()
@@ -2617,26 +1821,11 @@ util.openPanel = function()
 	panel.Visible = true
 	lastPreview = nil
 	util.updateBestDisplay()
-	panel.Size = UDim2.fromOffset(244, 170)
-	TweenService:Create(panel, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-		Size = UDim2.fromOffset(262, 185),
-	}):Play()
 end
 util.closePanel = function()
 	panelOpen = false
-	if state.dropdownOpen then
-		state.dropdownOpen = false
-		dropList.Visible = false
-		modeBtn.Visible = true
-		arrow.Rotation = 0
-	end
-	local t = TweenService:Create(panel, TweenInfo.new(0.16, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
-		Size = UDim2.fromOffset(244, 170),
-	})
-	t:Play()
-	t.Completed:Connect(function()
-		if not panelOpen then panel.Visible = false end
-	end)
+	if state.dropdownOpen then util.closeDropdown() end
+	panel.Visible = false
 end
 
 iconBtn.MouseButton1Click:Connect(function()
@@ -2651,9 +1840,7 @@ header.InputBegan:Connect(function(input)
 		dragStart = input.Position
 		startPos = panel.Position
 		input.Changed:Connect(function()
-			if input.UserInputState == Enum.UserInputState.End then
-				dragging = false
-			end
+			if input.UserInputState == Enum.UserInputState.End then dragging = false end
 		end)
 	end
 end)
@@ -2669,25 +1856,10 @@ UserInputService.InputChanged:Connect(function(input)
 	end
 end)
 
-iconBtn.MouseEnter:Connect(function()
-	TweenService:Create(iconBtn, TweenInfo.new(0.15, Enum.EasingStyle.Back), {
-		Size = UDim2.fromOffset(50, 50),
-	}):Play()
-end)
-iconBtn.MouseLeave:Connect(function()
-	TweenService:Create(iconBtn, TweenInfo.new(0.15, Enum.EasingStyle.Back), {
-		Size = UDim2.fromOffset(46, 46),
-	}):Play()
-end)
-
 if localPlayer.Character then
-	task.spawn(function()
-		util.setupCharacter(localPlayer.Character)
-	end)
+	task.spawn(function() util.setupCharacter(localPlayer.Character) end)
 end
-
 localPlayer.CharacterAdded:Connect(function(char)
-	util.stopNewTeleguiado()
 	util.cancelEverything()
 	util.setupCharacter(char)
 	if state.enabled then
@@ -2703,107 +1875,16 @@ localPlayer.CharacterAdded:Connect(function(char)
 	end
 end)
 
-util.updateModeUI()
 util.updateLoopUI()
 util.updateToggle()
-util.updateRarityChecks()
-
-util.integrityDynamicText = {
-	[toastText] = true,
-	[bestName] = true,
-	[bestRarity] = true,
-	[bestValue] = true,
-	[modeTitle] = true,
-	[modeDesc] = true,
-}
-util.integrityDynamicTextColor = { [bestRarity] = true, [util.loopLabel] = true }
-util.integrityDynamicTextTransparency = { [toastText] = true }
-util.integrityDynamicBackground = {
-	[modeBtn] = true,
-	[util.loopBox] = true,
-	[toggleTrack] = true,
-	[toggleKnob] = true,
-}
-util.integrityDynamicBackgroundTransparency = { [toast] = true }
-util.integrityDynamicSize = { [panel] = true, [iconBtn] = true }
-util.integrityDynamicPosition = { [panel] = true, [toast] = true, [toggleKnob] = true }
-util.integrityDynamicRotation = { [arrow] = true }
-util.integrityDynamicStrokeColor = {
-	[discordStroke] = true,
-	[modeStroke] = true,
-	[util.loopBoxStroke] = true,
-}
-util.integrityDynamicStrokeTransparency = { [toastStroke] = true }
-
-for i = 1, #rows do
-	local ui = rows[i]
-	util.integrityDynamicText[ui.NameLabel] = true
-	util.integrityDynamicText[ui.RarityLabel] = true
-	util.integrityDynamicText[ui.ValueLabel] = true
-	util.integrityDynamicTextColor[ui.RarityLabel] = true
-	util.integrityDynamicBackground[ui.Row] = true
-end
-for _, ui in pairs(rarityChecks) do
-	util.integrityDynamicText[ui.Box] = true
-	util.integrityDynamicTextColor[ui.Box] = true
-	util.integrityDynamicBackground[ui.Row] = true
-	util.integrityDynamicBackground[ui.Box] = true
-	util.integrityDynamicBackgroundTransparency[ui.Box] = true
-	util.integrityDynamicStrokeColor[ui.Stroke] = true
-	util.integrityDynamicStrokeTransparency[ui.Stroke] = true
-end
-
-util.armHubIntegrity({
-	gui = screenGui,
-	dynamicText = util.integrityDynamicText,
-	dynamicTextColor = util.integrityDynamicTextColor,
-	dynamicTextTransparency = util.integrityDynamicTextTransparency,
-	dynamicBackground = util.integrityDynamicBackground,
-	dynamicBackgroundTransparency = util.integrityDynamicBackgroundTransparency,
-	dynamicSize = util.integrityDynamicSize,
-	dynamicPosition = util.integrityDynamicPosition,
-	dynamicRotation = util.integrityDynamicRotation,
-	dynamicStrokeColor = util.integrityDynamicStrokeColor,
-	dynamicStrokeTransparency = util.integrityDynamicStrokeTransparency,
-	computed = {
-		{ instance = modeTitle, properties = { "Text" }, repair = util.updateModeUI },
-		{
-			instance = modeDesc,
-			properties = { "Text" },
-			repair = function()
-				util.updateToggle()
-				util.updateModeUI()
-			end,
-		},
-		{ instance = bestName, properties = { "Text" }, repair = util.updateBestDisplay },
-		{ instance = bestRarity, properties = { "Text", "TextColor3" }, repair = util.updateBestDisplay },
-		{ instance = bestValue, properties = { "Text" }, repair = util.updateBestDisplay },
-		{ instance = modeStroke, properties = { "Color" }, repair = util.updateToggle },
-		{ instance = util.loopBox, properties = { "BackgroundColor3" }, repair = util.updateLoopUI },
-		{ instance = util.loopBoxStroke, properties = { "Color" }, repair = util.updateLoopUI },
-	},
-	refresh = function()
-		util.updateModeUI()
-		util.updateLoopUI()
-		util.updateToggle()
-		util.updateRarityChecks()
-		util.updateBestDisplay()
-	end,
-})
-
-for i = 1, #rows do
-	local ui = rows[i]
-	util.integrityWatchComputed(ui.NameLabel, { "Text" }, util.refreshDropdownRows)
-	util.integrityWatchComputed(ui.RarityLabel, { "Text", "TextColor3" }, util.refreshDropdownRows)
-	util.integrityWatchComputed(ui.ValueLabel, { "Text" }, util.refreshDropdownRows)
-end
-for _, ui in pairs(rarityChecks) do
-	util.integrityWatchComputed(ui.Box, { "Text", "TextColor3", "BackgroundColor3", "BackgroundTransparency" }, util.updateRarityChecks)
-	util.integrityWatchComputed(ui.Stroke, { "Color", "Transparency" }, util.updateRarityChecks)
-end
-
 task.spawn(function()
 	task.wait(1)
-	util.refreshEggs(true)
-	util.updateBestDisplay()
+	pcall(function()
+		util.refreshEggs(true)
+		util.updateBestDisplay()
+	end)
 end)
+
+if not remotes.AskFieldEggSnapshot then
+	util.showToast("Remotes missing - check game")
+end
